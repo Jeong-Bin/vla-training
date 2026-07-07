@@ -1,0 +1,26 @@
+# nuReasoning VLA mini-project — core dependencies
+# Python 3.11, CUDA 12.x (driver 12.8). Install torch first via scripts/setup_env.sh.
+
+# --- data access / Milestone 0 ---
+huggingface_hub>=0.24
+pillow>=10.0
+numpy>=1.26
+pandas>=2.0
+
+# --- modeling / training (sft_data, training, evaluation) ---
+# torch is installed separately (CUDA build) in scripts/setup_env.sh
+transformers>=4.49
+accelerate>=0.34
+peft>=0.13
+bitsandbytes>=0.44
+datasets>=3.0
+sentencepiece>=0.2
+qwen-vl-utils>=0.0.8           # Qwen2.5-VL image/video preprocessing helper
+
+# --- retrieval eval ---
+scikit-learn>=1.4
+
+# --- utils / viz / reproducibility ---
+matplotlib>=3.8
+tqdm>=4.66
+jupyter>=1.0

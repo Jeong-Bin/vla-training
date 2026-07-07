@@ -1,0 +1,34 @@
+# raw downloaded clips (huge — never commit)
+data/
+*.zip
+*.pkl
+*.pcd
+
+# model artifacts
+*.safetensors
+*.bin
+outputs/
+checkpoints/
+adapters/
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+*.egg-info/
+
+# misc
+.DS_Store
+hf_cache/
+
+model/
+logs/
+.claude/
+results/
+nureasoning_viz/
+
+milestone_0.ipynb
+Full_pipeline_text_sft.md
+DECISIONS.md
+nuReasoning_project_spec.md
