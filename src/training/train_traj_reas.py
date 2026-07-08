@@ -55,7 +55,7 @@ import torch.nn as nn                                     # noqa: E402  (TrajRea
 from torch.utils.data import DataLoader                   # noqa: E402  (프리페치 데이터 파이프라인)
 
 from nureasoning import (  # noqa: E402  (학습·평가 공통 백본/캡/시간맥락 설정)
-    DEFAULT_MODEL, IMAGE_MAX_PIXELS, SEED, TEMPORAL, TEMPORAL_HISTORY_OFFSET,
+    DEFAULT_MODEL, IMAGE_MAX_PIXELS, SEED, SFT_TRAIN, SFT_VAL, TEMPORAL, TEMPORAL_HISTORY_OFFSET,
     VIEW_LABELS, load_image, load_processor, resolve_path, upsample_waypoints,
 )
 from training import ddp                                # noqa: E402  (torchrun DDP 헬퍼)
@@ -63,8 +63,8 @@ from training.dit_head import TrajectoryDiT, TrajectoryNormalizer  # noqa: E402
 from training.run_logging import RunLogger              # noqa: E402  (실시간 step·epoch 종합 로깅)
 from training.train_text_sft import LORA_TARGETS       # noqa: E402  (VLM LoRA 타깃, text_sft와 동일)
 
-DEFAULT_TRAIN = REPO / "data" / "sft" / "train.jsonl"
-DEFAULT_VAL = REPO / "data" / "sft" / "val.jsonl"
+DEFAULT_TRAIN = SFT_TRAIN     # 어떤 SFT를 쓸지는 vlm.SFT_DIR이 중앙 결정(현재 data/sft_v2). --train으로 override.
+DEFAULT_VAL = SFT_VAL
 TRAJ_PROMPT_FILE = REPO / "prompts" / "trajectory_plan_v1.txt"
 
 

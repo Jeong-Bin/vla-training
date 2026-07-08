@@ -23,7 +23,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src"))
 
-from nureasoning import load_image, load_processor, resolve_path, upsample_waypoints  # noqa: E402
+from nureasoning import SFT_VAL, load_image, load_processor, resolve_path, upsample_waypoints  # noqa: E402
 from sft_data.chat_format import view_caption                         # noqa: E402
 from evaluation.eval_trajectory import eval_out_dir                   # noqa: E402  (저장 위치 일관)
 from evaluation.bev import render_bev                                # noqa: E402  (HD맵+객체박스+궤적 BEV)
@@ -37,7 +37,7 @@ GRID_POS = {
     "back_left": (2, 0), "back": (2, 1), "back_right": (2, 2),
 }
 
-DEFAULT_MANIFEST = REPO / "data" / "sft" / "val.jsonl"
+DEFAULT_MANIFEST = SFT_VAL     # vlm.SFT_DIR 중앙 설정 따름(현재 data/sft_v2/val.jsonl). --manifest로 override.
 TRAJ_PROMPT_FILE = REPO / "prompts" / "trajectory_plan_v1.txt"
 
 

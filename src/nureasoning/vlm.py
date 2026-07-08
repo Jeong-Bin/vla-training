@@ -67,6 +67,18 @@ IMAGE_MIN_PIXELS = 64 * 28 * 28
 #           토큰↑(메모리↑). 둘은 근본적으로 다른 전처리라 비교 실험 시 한쪽으로 통일해야 공정.
 IMAGE_SQUARE: "int | None" = None
 
+# ─── SFT 데이터셋 선택(학습·평가 공통 단일 출처) ──────────────────────────────────
+# 어떤 SFT 빌드를 학습/평가에 쓸지 여기서 중앙 결정한다. build_sft.py는 이 경로에 {train,val}.jsonl을
+# 만들고(--out 미지정 시), train_traj_reas.py/eval_*.py는 이 경로를 기본 train/val로 읽는다(--train/--val로
+# override 가능). 새 빌드를 낼 때 기존을 덮지 않으려면 이 값만 바꾸면 된다(예: data/sft → data/sft_v2).
+#   sft    : 초기 빌드(기동 신호 없음).
+#   sft_v2 : maneuver_lateral/maneuver_max_lateral(selective-view 기동 신호) 포함 재빌드.
+import pathlib as _pathlib
+_REPO = _pathlib.Path(__file__).resolve().parents[2]
+SFT_DIR: "_pathlib.Path" = _REPO / "data" / "sft_v2"
+SFT_TRAIN: "_pathlib.Path" = SFT_DIR / "train.jsonl"
+SFT_VAL: "_pathlib.Path" = SFT_DIR / "val.jsonl"
+
 # ─── 시간 맥락(temporal multi-frame) 입력 스위치 ──────────────────────────────────
 # 논문 nuVLA는 condition으로 "현재 + 과거 timestep"(최대 2×8=16장)을 쓴다. 미니프로젝트 기본은
 # 단일 프레임(현재 8뷰)이지만, 아래 두 값으로 과거 1 timestep을 더 넣어 논문 방식을 재현할 수 있다.
@@ -122,6 +134,9 @@ __all__ = [
     "IMAGE_MAX_PIXELS",
     "IMAGE_MIN_PIXELS",
     "IMAGE_SQUARE",
+    "SFT_DIR",
+    "SFT_TRAIN",
+    "SFT_VAL",
     "TEMPORAL",
     "TEMPORAL_HISTORY_OFFSET",
     "load_image",

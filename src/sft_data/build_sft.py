@@ -36,6 +36,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 from nureasoning import (  # noqa: E402
     CAMERA_VIEWS,
+    SFT_DIR,
     TEMPORAL,
     TEMPORAL_HISTORY_OFFSET,
     Clip,
@@ -52,7 +53,7 @@ from evaluation import taxonomy as T  # noqa: E402
 # 클립이 REPO 안/밖 어디에 있든 relative_to(REPO) 실패 없이 학습·평가가 그대로 로드한다.
 DEFAULT_CLIPS_ROOT = Path("/home/etri/DATASET/nureasoning/clips")
 VAL_MANIFEST = REPO / "data" / "eval" / "zeroshot_manifest.jsonl"
-OUT_DIR = REPO / "data" / "sft"
+OUT_DIR = SFT_DIR     # 기본 출력 = vlm.SFT_DIR(중앙 설정, 현재 data/sft_v2). --out으로 override.
 
 # 스펙 §7 예시의 instruction(미션 + 간단 질의). 사람이 읽는 content 레벨 문구이며,
 # 실제 학습에 쓰는 프롬프트는 chat_format 어댑터가 평가와 동일한 템플릿으로 렌더한다.
@@ -235,6 +236,14 @@ def frame_to_trajectory_sft(f: Frame, n_points: int = TRAJ_N_POINTS) -> tuple[Op
     if len(wp) < n_points:                               # 고정 길이 미달 → 제외(패딩 대신 단순 제외)
         return None, "short_trajectory"
     out = {"waypoints": [[round(float(x), 2), round(float(y), 2), round(float(th), 3)] for x, y, th in wp]}
+    # selective-view용 기동 신호(연속값, 이산화는 학습/평가 시 thr로): ego-frame 미래궤적의 lateral(=left) 성분.
+    #   maneuver_lateral     = 최종(5초 뒤) lateral 변위(m). 부호=방향(+좌/−우), 크기=정도.
+    #   maneuver_max_lateral = 5초 내 |lateral| 최대(m). 차선변경(갔다 유지)은 둘 다 큼, 회피(갔다 복귀)는 max만 큼.
+    #   ⚠️ thr은 여기서 고정하지 않는다 — 원본 연속값만 심어 학습·평가에서 abs(·)<thr로 자유롭게 이산화(재빌드 불필요).
+    #   검증: Lateral 텍스트 라벨과 최종변위 3분류 일치 82~86%(analysis/maneuver_from_traj.py, thr 0.75~2.0).
+    lat = [float(row[1]) for row in wp]
+    out["maneuver_lateral"] = round(lat[-1], 3)
+    out["maneuver_max_lateral"] = round(max(lat, key=abs), 3)
     parts = _reasoning_parts(f)                          # {spatial?,decision?,counterfactual?} 있는 것만
     if parts:
         out["reasoning_parts"] = parts

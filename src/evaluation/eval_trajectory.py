@@ -21,11 +21,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "src"))
 
-from nureasoning import load_processor, upsample_waypoints             # noqa: E402
+from nureasoning import SFT_VAL, load_processor, upsample_waypoints             # noqa: E402
 from training.dit_head import TrajectoryDiT, TrajectoryNormalizer  # noqa: E402
 from training.train_traj_reas import encode_condition, ego_vec, history_for, load_vlm, has_reasoning_annotation  # noqa: E402  (학습=평가 동일 인코더/ego/시간맥락/필터)
 
-DEFAULT_MANIFEST = REPO / "data" / "sft" / "val.jsonl"
+DEFAULT_MANIFEST = SFT_VAL     # vlm.SFT_DIR 중앙 설정 따름(현재 data/sft_v2/val.jsonl). --manifest로 override.
 TRAJ_PROMPT_FILE = REPO / "prompts" / "trajectory_plan_v1.txt"
 RESULTS = REPO / "results"
 
