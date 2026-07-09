@@ -23,7 +23,8 @@ sys.path.insert(0, str(REPO / "src"))
 
 from nureasoning import SFT_VAL, load_processor, upsample_waypoints             # noqa: E402
 from training.dit_head import TrajectoryDiT, TrajectoryNormalizer  # noqa: E402
-from training.train_traj_reas import encode_condition, ego_vec, history_for, load_vlm, has_reasoning_annotation  # noqa: E402  (학습=평가 동일 인코더/ego/시간맥락/필터)
+from training.train_traj_reas import (encode_condition, ego_vec, history_for, load_vlm,  # noqa: E402
+                                       has_reasoning_annotation, gate_views, rec_maneuver)  # 학습=평가 동일 인코더/ego/시간맥락/필터/게이팅
 
 DEFAULT_MANIFEST = SFT_VAL     # vlm.SFT_DIR 중앙 설정 따름(현재 data/sft_v2/val.jsonl). --manifest로 override.
 TRAJ_PROMPT_FILE = REPO / "prompts" / "trajectory_plan_v1.txt"
@@ -112,22 +113,41 @@ def main() -> None:
     dit.load_state_dict(torch.load(adapter / "dit_head.pt", map_location="cuda:0"))
     dit.eval()
     temporal_on = cfg.get("temporal", False)              # 학습이 과거뷰를 썼으면 평가도 동일하게(일관)
+    man_thr = cfg.get("maneuver_lateral_thr", -1.0)       # selective-view 게이팅(학습과 동일 thr)
     print(f"evaluating {len(recs)} trajectory samples (ODE steps={args.steps}, "
-          f"temporal={'ON' if temporal_on else 'OFF'})\n")
+          f"temporal={'ON' if temporal_on else 'OFF'}, "
+          f"selective-view={'thr='+str(man_thr)+'m' if man_thr is not None and man_thr >= 0 else 'OFF(8뷰)'})\n")
 
     from evaluation.planning_metrics import planning_scores, aggregate, format_table
+
+    # 추론 속도 계측(샘플당 VLM encode + DiT ODE sample, 즉 "1 프레임 planning 추론" 전체 wall-clock).
+    #   ⚠️ GPU는 비동기 실행이라 커널 큐잉만으로는 시간이 부정확 → 구간 앞뒤로 cuda.synchronize() 필수.
+    #   워밍업(cuDNN 알고리즘 탐색·커널 컴파일 등)으로 첫 샘플이 비정상적으로 느릴 수 있어 통계에서 제외
+    #   (표준 벤치마크 관례). 게이팅(selective-view) 중이면 뷰 수가 샘플마다 달라 속도 자체가 변동하는 게
+    #   정상 — 이 분포(Fastest/Slowest/Median/Mean)가 곧 "게이팅이 속도에 주는 실효"의 근거가 된다.
+    import time
+    infer_times_ms = []                                    # 워밍업(첫 샘플) 제외 나머지 전부(초→ms)
 
     rows, ades, fdes, cv_ades, cv_fdes, plan_rows = [], [], [], [], [], []
     for i, rec in enumerate(recs, 1):
         prompt = prompt_tpl.replace("{mission}", rec.get("mission") or "drive safely")
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
         with torch.no_grad():                              # 평가: VLM forward도 grad 불필요
-            cvec, mem, mem_mask = encode_condition(vlm, processor, rec["images"], prompt,
-                                                   history_for(rec, temporal_on))
+            _ml = rec_maneuver(rec)
+            cvec, mem, mem_mask = encode_condition(vlm, processor,
+                                                   gate_views(rec["images"], _ml, man_thr), prompt,
+                                                   gate_views(history_for(rec, temporal_on), _ml, man_thr))
             cond = cvec.unsqueeze(0).to("cuda:0"); mem = mem.to("cuda:0"); mem_mask = mem_mask.to("cuda:0")
         ego = torch.tensor([ego_vec(rec, dit.ego_dim)], dtype=torch.float32, device="cuda:0") \
             if dit.ego_dim > 0 else None
         pred_norm = dit.sample(cond, steps=args.steps, deterministic=True, ego=ego,
                                mem=mem, mem_mask=mem_mask)[0]  # (T,point_dim) 정규화(결정론)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()                        # GPU 큐 비우고 나서 시간 확정(비동기 실행 보정)
+        if i > 1:                                           # 첫 샘플=워밍업 → 통계 제외
+            infer_times_ms.append((time.perf_counter() - t0) * 1000.0)
         pred_wp = normalizer.denormalize(pred_norm.cpu()).numpy()  # 미터 공간으로 역정규화 (T,3)[fwd,left,θ]@2Hz
         gt_wp = np.asarray(rec["output"]["waypoints"])
         # 논문 ADE: 예측/GT를 Δt=0.1s(10Hz)로 51 poses(현재 pose 포함) 보간 후 평가(planning_metrics도 10Hz 가정).
@@ -143,7 +163,8 @@ def main() -> None:
                      **{k: round(v, 3) for k, v in ps.items()},
                      "pred_final": [round(float(x), 2) for x in pred[-1]],
                      "gt_final": [round(float(x), 2) for x in gt[-1]]})
-        print(f"[{i}/{len(recs)}] {rec['id']}  ADE={ade:.2f}m FDE={fde:.2f}m  (cv: {cv_ade:.2f}/{cv_fde:.2f})")
+        t_tag = f"  t={infer_times_ms[-1]:.1f}ms" if i > 1 else "  t=(warmup, 통계제외)"
+        print(f"[{i}/{len(recs)}] {rec['id']}  ADE={ade:.2f}m FDE={fde:.2f}m  (cv: {cv_ade:.2f}/{cv_fde:.2f}){t_tag}")
 
     # adapter가 REPO 하위면 상대경로로, 아니면(예: 상대경로 입력) 그대로 문자열화(ValueError 방지).
     try:
@@ -151,6 +172,21 @@ def main() -> None:
     except ValueError:
         adapter_str = str(adapter)
     plan_agg = aggregate(plan_rows)                       # NC_mean..NPS_mean + n_nps
+    # 추론 속도 통계(ms, 워밍업 제외 n=len(recs)-1개 기준). 정렬 후 fastest=최솟값, slowest=최댓값,
+    #   median=중앙값(짝수개면 두 중앙값 평균), mean=산술평균.
+    t_sorted = sorted(infer_times_ms)
+    n_t = len(t_sorted)
+    if n_t:
+        median_ms = (t_sorted[n_t // 2] if n_t % 2 else (t_sorted[n_t // 2 - 1] + t_sorted[n_t // 2]) / 2)
+        speed_stats = {
+            "n_timed": n_t,                                # 워밍업(첫 샘플) 제외 표본 수
+            "fastest_ms": round(t_sorted[0], 2),
+            "slowest_ms": round(t_sorted[-1], 2),
+            "median_ms": round(median_ms, 2),
+            "mean_ms": round(sum(t_sorted) / n_t, 2),
+        }
+    else:                                                  # 샘플 1개뿐이면 워밍업만 있고 계측 표본 0
+        speed_stats = {"n_timed": 0, "fastest_ms": None, "slowest_ms": None, "median_ms": None, "mean_ms": None}
     metrics = {
         "n_samples": len(recs),
         "model": cfg["model"], "adapter": adapter_str,
@@ -158,10 +194,12 @@ def main() -> None:
         "ADE_baseline_cv": round(float(np.mean(cv_ades)), 3),
         "FDE_baseline_cv": round(float(np.mean(cv_fdes)), 3),
         "ode_steps": args.steps,
+        "maneuver_lateral_thr": man_thr,                   # 이 속도 통계가 어떤 게이팅 조건에서 나왔는지 기록
+        "inference_speed_ms": speed_stats,                 # 샘플당 VLM encode+DiT sample wall-clock(ms), 워밍업 제외
         **plan_agg,
     }
 
-    out_dir = eval_out_dir(cfg)                            # 학습 실행 폴더(run_dir)에 저장
+    out_dir = eval_out_dir(cfg)
     pred_path = out_dir / f"{args.tag}_predictions.jsonl"
     with open(pred_path, "w") as fh:
         for r in rows:
@@ -174,6 +212,15 @@ def main() -> None:
     print(f"\n=== planning metrics (nuReasoning Table 3 style, 5s horizon, n={len(recs)}) ===")
     print(format_table(plan_agg, ade=metrics["ADE_mean"]))
     print(f"(NPS 유효 표본 {plan_agg.get('n_nps', 0)}/{len(recs)}; 미니 근사 — planning_metrics.py 주석 참고)")
+    print(f"\n=== inference speed (ms/sample, VLM encode + DiT sample, n={speed_stats['n_timed']}, "
+          f"1번째 워밍업 제외, selective-view thr={man_thr}) ===")
+    if speed_stats["n_timed"]:
+        print(f"  Fastest: {speed_stats['fastest_ms']:8.2f} ms")
+        print(f"  Slowest: {speed_stats['slowest_ms']:8.2f} ms")
+        print(f"  Median : {speed_stats['median_ms']:8.2f} ms")
+        print(f"  Mean   : {speed_stats['mean_ms']:8.2f} ms")
+    else:
+        print("  (표본 부족 — n_samples<=1)")
     print(f"\nwrote {metrics_path.relative_to(REPO)} and {pred_path.relative_to(REPO)}")
 
 

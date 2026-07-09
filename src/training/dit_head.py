@@ -250,4 +250,43 @@ class TrajectoryNormalizer:
         return cls(torch.tensor(d["mean"]), torch.tensor(d["std"]))
 
 
-__all__ = ["TrajectoryDiT", "TrajectoryNormalizer", "timestep_embedding"]
+# GateHead: selective-view 1단계 게이트 — pooled VLM cond(B,Dc) → 3-class logits(직진/좌/우).
+#   DiT(cross_attn 여부)와 독립: 게이트는 항상 **pooled** cond를 쓴다(3분류엔 시퀀스 전체 불필요).
+#   타깃(build_sft.gate_direction)은 "과거에 관측된 가장 최근 Driving decision.Lateral을 이월한 값"이라
+#   미래 GT가 아니다(인과 안전). cond 자체는 그 시점 게이팅된 뷰로 만들어질 수 있으나, 타깃이 그 뷰
+#   구성과 독립적으로 갈릴 수 있어(과거 결정이 "좌"여도 현재 새 관측이 "직진"일 수 있음) 입력 구성을
+#   그대로 베끼는 지름길 학습이 성립하지 않는다.
+class GateHead(nn.Module):
+    def __init__(self, cond_dim: int, hidden: int = 128, n_classes: int = 3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(cond_dim, hidden), nn.SiLU(), nn.Linear(hidden, n_classes),
+        )
+        # cond 정규화 통계(DiT의 cond_mean/std와 동일 목적 — massive-activation 공통성분 제거).
+        #   게이트는 DiT와 별개 모듈이라 자체 버퍼를 둔다(학습기가 동일 fit_conds로 set_stats).
+        self.register_buffer("cond_mean", torch.zeros(cond_dim))
+        self.register_buffer("cond_std", torch.ones(cond_dim))
+        nn.init.zeros_(self.net[-1].weight); nn.init.zeros_(self.net[-1].bias)  # 초기 균등분포(logit=0)
+
+    @torch.no_grad()
+    def set_cond_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        self.cond_mean.copy_(mean.to(self.cond_mean.device, self.cond_mean.dtype))
+        self.cond_std.copy_(std.clamp_min(1e-6).to(self.cond_std.device, self.cond_std.dtype))
+
+    def forward(self, cond: torch.Tensor) -> torch.Tensor:
+        cond = (cond.float() - self.cond_mean) / self.cond_std
+        return self.net(cond)                              # (B, n_classes) logits
+
+
+# focal_loss: class-weighted focal loss(Lin et al. 2017) — 클래스 불균형(직진 과다표본)에 CE보다 강함.
+#   alpha(클래스별 가중, 표본수 역비례)로 손실 기여를 재조정 + (1-p_t)^gamma로 이미 잘 맞추는 쉬운 표본
+#   (다수인 straight)의 손실을 자동 감쇠 → 학습이 어려운 소수클래스(좌/우)에 더 집중된다.
+#   gamma=0이면 순수 class-weighted CE와 동일(focal 끄기).
+def focal_loss(logits: torch.Tensor, target: torch.Tensor, alpha: "torch.Tensor | None" = None,
+              gamma: float = 2.0) -> torch.Tensor:
+    ce = nn.functional.cross_entropy(logits, target, weight=alpha, reduction="none")   # (B,)
+    pt = torch.exp(-ce)                                    # 정답 클래스 예측확률 p_t = exp(-CE)
+    return ((1 - pt) ** gamma * ce).mean()
+
+
+__all__ = ["TrajectoryDiT", "TrajectoryNormalizer", "GateHead", "focal_loss", "timestep_embedding"]

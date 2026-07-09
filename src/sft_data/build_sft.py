@@ -191,6 +191,44 @@ def _decision_reasoning_text(f: Frame) -> Optional[str]:
     return (f.reasoning_trace() or "").strip() or None
 
 
+# GATE_LABEL: selective-view 게이팅용 3분류(정수). 0=직진(뷰 게이팅 없음), 1=좌, 2=우.
+#   Driving decision.Lateral(7종 자유값)을 방향 3종으로 통합(회전/차선변경/미세이동을 좌·우로 묶음) —
+#   게이팅이 필요한 건 "카메라를 어느 방향으로 켤까"뿐이라 세부 기동 종류는 불필요.
+GATE_LABEL = {"straight": 0, "left": 1, "right": 2}
+
+
+# _lateral_to_gate: Driving decision.Lateral 원문 문자열 → {straight,left,right}(없으면 None).
+#   analysis/maneuver_from_traj.py의 lateral_dir과 동일 매핑(검증된 3분류).
+def _lateral_to_gate(lateral: str) -> Optional[str]:
+    s = (lateral or "").strip().lower()
+    if not s:
+        return None
+    if "no lateral" in s:
+        return "straight"
+    if "left" in s:
+        return "left"
+    if "right" in s:
+        return "right"
+    return None
+
+
+# _gate_directions_for_clip: clip의 **전 프레임(10Hz 순서)**을 순회하며 Lateral을 관측된 시점부터
+#   다음 관측까지 이월(propagation)한 {frame_index: "straight"|"left"|"right"} 매핑을 만든다.
+#   ⚠️ 인과 유지: 이 값은 "과거에 관측된 가장 최근 결정"이라 미래 정보가 섞이지 않는다(oracle 아님).
+#   첫 관측 이전 구간(clip 시작~최초 키프레임)은 관측된 과거 결정이 없으므로 안전측 기본값 "straight".
+def _gate_directions_for_clip(frames: list) -> dict:
+    out: dict = {}
+    current = "straight"                      # 첫 결정 관측 전 기본값(안전측 = 뷰 게이팅 없음)
+    for f in frames:
+        dec = f.driving_decision()             # {"Longitudinal","Lateral"} or None(spatial-only 프레임)
+        if dec is not None:
+            g = _lateral_to_gate(dec.get("Lateral", ""))
+            if g is not None:
+                current = g                    # 새 관측 → 이월값 갱신(다음 관측 전까지 유지)
+        out[f.frame_index] = current
+    return out
+
+
 # _counterfactual_reasoning_text: Alternative/Top safety-critical actions를 "행동 → 위험등급: 이유" 텍스트로.
 def _counterfactual_reasoning_text(f: Frame) -> Optional[str]:
     cf = f.counterfactual()
@@ -226,7 +264,8 @@ def _reasoning_parts(f: Frame) -> dict:
 # reasoning이 있는 프레임이면 3종(spatial/decision/counterfactual) 텍스트를 output.reasoning_parts에 실어
 # 논문식 "궤적+reasoning 공동 supervision"을 가능케 한다 — 학습기(train_traj_reas)가 --reasoning-types로
 # 어떤 종류를 LM_loss 타깃으로 쓸지 단계별 선택한다(baseline=無 → +spatial → +decision → +counterfactual).
-def frame_to_trajectory_sft(f: Frame, n_points: int = TRAJ_N_POINTS) -> tuple[Optional[dict], Optional[str]]:
+def frame_to_trajectory_sft(f: Frame, n_points: int = TRAJ_N_POINTS,
+                           gate_direction: Optional[str] = None) -> tuple[Optional[dict], Optional[str]]:
     if not f.has_camera("front"):
         return None, "no_front_image"
     wp = future_waypoints_ego(f.ego_state(), n_points,   # (T,3) [fwd,left,θ] ego-frame, 2Hz(stride 5)
@@ -244,6 +283,11 @@ def frame_to_trajectory_sft(f: Frame, n_points: int = TRAJ_N_POINTS) -> tuple[Op
     lat = [float(row[1]) for row in wp]
     out["maneuver_lateral"] = round(lat[-1], 3)
     out["maneuver_max_lateral"] = round(max(lat, key=abs), 3)
+    # gate_direction(정수 0/1/2): 과거에 관측된 가장 최근 Driving decision.Lateral을 이월한 값(인과 안전,
+    #   미래 GT 미사용). selective-view 게이트 분류기(1단계 판단)의 학습 타깃 + 뷰 게이팅 인덱스로 쓴다.
+    #   None이면(이 clip에 아직 Lateral 관측이 없거나 build 구버전) 필드 자체를 생략(하위호환).
+    if gate_direction is not None:
+        out["gate_direction"] = GATE_LABEL[gate_direction]
     parts = _reasoning_parts(f)                          # {spatial?,decision?,counterfactual?} 있는 것만
     if parts:
         out["reasoning_parts"] = parts
@@ -325,10 +369,15 @@ def build(clips_root: Path, out_dir: Path, traj_stride: int = 10) -> dict:
             hist = _history_images(clip, f)     # TEMPORAL=False면 항상 None(현재 프레임만)
             _emit_with_hist(frame_to_sft(f), hist)             # driving (결정 없는 프레임은 no_decision으로 스킵)
             _emit_with_hist(frame_to_spatial_sft(f), hist)     # spatial (1Hz 프레임 전체)
+        # gate_direction 이월(propagation): clip **전 프레임(10Hz, 순서대로)**을 한 번 훑어 frame_index별
+        # "가장 최근 관측된 Lateral"을 계산(인과 안전 — 미래 GT 미사용). trajectory 샘플이 이 값을 참조.
+        all_frames = select_keyframes(clip, policy="all")
+        gate_map = _gate_directions_for_clip(all_frames)
         # trajectory: 10Hz 전 프레임을 traj_stride로 → planning 밀도 ↑ (short_trajectory/이미지결측은 스킵)
-        for f in select_keyframes(clip, policy="all")[:: max(1, traj_stride)]:
+        for f in all_frames[:: max(1, traj_stride)]:
             hist = _history_images(clip, f)
-            _emit_with_hist(frame_to_trajectory_sft(f), hist)  # trajectory (10Hz 밀도)
+            gd = gate_map.get(f.frame_index)
+            _emit_with_hist(frame_to_trajectory_sft(f, gate_direction=gd), hist)  # trajectory (10Hz 밀도)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     report: dict = {"skips": dict(skips), "splits": {}}
@@ -359,6 +408,10 @@ def build(clips_root: Path, out_dir: Path, traj_stride: int = 10) -> dict:
         if traj:                                            # 궤적 GT 평균 전방 도달거리(검증용 sanity)
             finals = [r["output"]["waypoints"][-1][0] for r in traj]        # 마지막 waypoint의 fwd(m)
             report["splits"][name]["traj_final_fwd_m_mean"] = round(sum(finals) / len(finals), 1)
+            gd = Counter(r["output"]["gate_direction"] for r in traj if "gate_direction" in r["output"])
+            if gd:                                          # {0:straight,1:left,2:right} 이월 분포(selective-view)
+                report["splits"][name]["gate_direction_dist"] = {
+                    {0: "straight", 1: "left", 2: "right"}[k]: v for k, v in gd.most_common()}
     report["val_clip_tokens_known"] = len(val_tokens)
     # 시간 맥락 설정 스냅샷(빌드 시점 vlm.py 값) — 데이터가 어떤 temporal 설정으로 만들어졌는지 추적.
     report["temporal"] = {"enabled": TEMPORAL, "history_offset": TEMPORAL_HISTORY_OFFSET}

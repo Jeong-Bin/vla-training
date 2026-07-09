@@ -28,7 +28,7 @@ from sft_data.chat_format import view_caption                         # noqa: E4
 from evaluation.eval_trajectory import eval_out_dir                   # noqa: E402  (저장 위치 일관)
 from evaluation.bev import render_bev                                # noqa: E402  (HD맵+객체박스+궤적 BEV)
 from training.dit_head import TrajectoryDiT, TrajectoryNormalizer     # noqa: E402
-from training.train_traj_reas import encode_condition, ego_vec, history_for, load_vlm   # noqa: E402
+from training.train_traj_reas import encode_condition, ego_vec, history_for, load_vlm, gate_views, rec_maneuver   # noqa: E402
 
 # 8뷰 3×3 surround 배치(view_8cam.py와 동일). 중앙(1,1)은 GT 텍스트용.
 GRID_POS = {
@@ -96,6 +96,9 @@ def plot_8view(sample, out_path):
     from PIL import Image
 
     by_view = {im["view"]: im["path"] for im in sample["images"]}
+    # selective-view: gated_views가 있으면(=게이팅 on) 그 집합 밖의 뷰는 "실제로 VLM에 안 들어간 뷰".
+    #   None이면(게이팅 off·구버전) 전 뷰가 입력된 것으로 간주(하위호환).
+    gated = sample.get("gated_views")
     fig = plt.figure(figsize=(22, 12))
     # 열 구성: [카메라0,1,2] [spacer] [BEV]. spacer 열(폭 0.05)을 둬 HD맵을 카메라에서 오른쪽으로 띄운다.
     # left/right/top/bottom 여백 최소화 + wspace/hspace 작게 → 카메라가 공간을 꽉 채운다.
@@ -103,11 +106,21 @@ def plot_8view(sample, out_path):
                           left=0.005, right=0.975, top=0.955, bottom=0.04,
                           wspace=0.03, hspace=0.03)
     # 8뷰 카메라(왼쪽 3열). 라벨(title) 없음. aspect="auto"로 셀을 꽉 채워 여백 제거(약간 늘어남 감수).
+    #   selective-view로 꺼진 뷰는 흐리게(alpha)+빗금 테두리+"(off)" 라벨로 "이미지는 있지만 모델에
+    #   입력 안 됨"을 명확히 구분(단순 missing=이미지 자체가 없음과 다른 의미).
     for v, (r, c) in GRID_POS.items():
         ax = fig.add_subplot(gs[r, c])
         ax.axis("off")
+        is_gated_off = gated is not None and v not in gated
         if v in by_view:
-            ax.imshow(Image.open(resolve_path(by_view[v], REPO)).convert("RGB"), aspect="auto")
+            img = Image.open(resolve_path(by_view[v], REPO)).convert("RGB")
+            ax.imshow(img, aspect="auto", alpha=0.3 if is_gated_off else 1.0)
+            if is_gated_off:                                # 굵은 점선 테두리로 "게이팅으로 꺼짐" 표시
+                ax.add_patch(plt.Rectangle((0, 0), 1, 1, transform=ax.transAxes, fill=False,
+                                           edgecolor="gray", linewidth=2, linestyle="--"))
+                ax.text(0.5, 0.5, "(off)", ha="center", va="center", transform=ax.transAxes,
+                        fontsize=14, color="white", weight="bold",
+                        bbox=dict(boxstyle="round", fc="gray", alpha=0.7))
         else:
             ax.text(0.5, 0.5, f"{v}\n(missing)", ha="center", va="center")
 
@@ -242,16 +255,20 @@ def main() -> None:
     prompt_tpl = TRAJ_PROMPT_FILE.read_text()
     do_reas = not args.no_reasoning and vlm_mode != "frozen"   # frozen은 VLM 미학습 → reasoning 무의미
     temporal_on = cfg.get("temporal", False)              # 학습이 과거뷰를 썼으면 평가도 동일하게(일관)
+    man_thr = cfg.get("maneuver_lateral_thr", -1.0)       # selective-view 게이팅(학습과 동일 thr)
     print(f"qualitative eval on {len(chosen)} samples (reasoning={'on' if do_reas else 'off'}, "
-          f"temporal={'on' if temporal_on else 'off'})\n")
+          f"temporal={'on' if temporal_on else 'off'}, "
+          f"selective-view={'thr='+str(man_thr)+'m' if man_thr is not None and man_thr >= 0 else 'off'})\n")
 
     samples = []
     for i, rec in enumerate(chosen, 1):
         prompt = prompt_tpl.replace("{mission}", rec.get("mission") or "drive safely")
-        hist = history_for(rec, temporal_on)              # 과거 8뷰(temporal_on일 때만)
+        _ml = rec_maneuver(rec)
+        hist = gate_views(history_for(rec, temporal_on), _ml, man_thr)     # 과거 8뷰(temporal_on일 때만) 게이팅
         # 1) 궤적 예측
         with torch.no_grad():
-            cvec, mem, mem_mask = encode_condition(vlm, processor, rec["images"], prompt, hist)
+            cvec, mem, mem_mask = encode_condition(vlm, processor,
+                                                   gate_views(rec["images"], _ml, man_thr), prompt, hist)
             cond = cvec.unsqueeze(0).to("cuda:0"); mem = mem.to("cuda:0"); mem_mask = mem_mask.to("cuda:0")
         ego = torch.tensor([ego_vec(rec, dit.ego_dim)], dtype=torch.float32, device="cuda:0") \
             if dit.ego_dim > 0 else None
@@ -268,7 +285,10 @@ def main() -> None:
                         "ade": float(d.mean()), "fde": float(d[-1]),
                         "images": rec["images"], "mission": rec.get("mission"),
                         "gt_reasoning": gt_reas,
-                        "pred_reasoning": gen})          # 8뷰 가운데 요약에 표시
+                        "pred_reasoning": gen,            # 8뷰 가운데 요약에 표시
+                        # selective-view: 실제 VLM에 입력된 뷰 이름 집합(None=게이팅 off, 전 8뷰 입력).
+                        "gated_views": (sorted(im["view"] for im in gate_views(rec["images"], _ml, man_thr))
+                                       if man_thr is not None and man_thr >= 0 else None)})
         print(f"[{i}/{len(chosen)}] {rec['id']}  ADE={d.mean():.2f}m FDE={d[-1]:.2f}m")
         if do_reas:
             print(f"    PRED: {gen[:200]}")
