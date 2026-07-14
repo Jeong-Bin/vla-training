@@ -260,3 +260,7 @@ condition + reasoning LM_loss → **flow-matching DiT 학습(공동 손실 `flow
 ③ 변환은 `geometry.py`, ④는 `build_sft.py`, DiT는 `dit_head.py`, ⑤ 공동 학습은 `train_traj_reas.py`,
 평가는 `eval_trajectory.py`가 담당한다. VLM 학습 범위는 `--vlm-mode`(full 기본·lora·frozen)로 고른다.
 텍스트 결정/인식 경로는 [Full_pipeline_text_sft.md](Full_pipeline_text_sft.md)를 보라.
+
+
+## 방법 B — 시퀀스 학습으로 전환 (아직은 아니지만 향후 이 방향으로 코드 수정)
+프레임을 시간 순서로 묶어 처리(clip 단위 시퀀스 배치). 그러면 진짜 "이전 프레임 예측"을 전달 가능. → 하지만 파이프라인 대수술(DataLoader, 배치 구조, DDP 샤딩 전부 변경) + 표본 상관으로 학습 불안정 위험.

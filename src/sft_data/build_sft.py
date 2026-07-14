@@ -213,19 +213,22 @@ def _lateral_to_gate(lateral: str) -> Optional[str]:
 
 
 # _gate_directions_for_clip: clip의 **전 프레임(10Hz 순서)**을 순회하며 Lateral을 관측된 시점부터
-#   다음 관측까지 이월(propagation)한 {frame_index: "straight"|"left"|"right"} 매핑을 만든다.
+#   다음 관측까지 이월(propagation)한 {frame_index: "straight"|"left"|"right"|None} 매핑을 만든다.
 #   ⚠️ 인과 유지: 이 값은 "과거에 관측된 가장 최근 결정"이라 미래 정보가 섞이지 않는다(oracle 아님).
-#   첫 관측 이전 구간(clip 시작~최초 키프레임)은 관측된 과거 결정이 없으므로 안전측 기본값 "straight".
+#   ⚠️ **첫 관측(첫 키프레임=frame ~50) 이전 구간(frame 0~49)은 관측된 과거 결정이 없다** → None으로 둔다.
+#      이 None은 "gate_direction 미정"을 뜻해 build가 gate_direction 필드를 심지 않는다 → 게이트 손실에서
+#      제외된다(그 straight가 '실제 직진'이 아니라 '관측 전 기본값'이라 게이트 학습을 오염시키므로).
+#      추론/학습의 뷰 게이팅에서는 prev_dir=None이 안전측 전 8뷰로 처리되어 인과는 유지된다.
 def _gate_directions_for_clip(frames: list) -> dict:
     out: dict = {}
-    current = "straight"                      # 첫 결정 관측 전 기본값(안전측 = 뷰 게이팅 없음)
+    current = None                            # 첫 결정 관측 전 = None(gate 손실 제외; 안전측 전 8뷰)
     for f in frames:
         dec = f.driving_decision()             # {"Longitudinal","Lateral"} or None(spatial-only 프레임)
         if dec is not None:
             g = _lateral_to_gate(dec.get("Lateral", ""))
             if g is not None:
                 current = g                    # 새 관측 → 이월값 갱신(다음 관측 전까지 유지)
-        out[f.frame_index] = current
+        out[f.frame_index] = current           # 관측 전이면 None(첫 키프레임 이전 frame 0~49)
     return out
 
 
@@ -289,6 +292,10 @@ def frame_to_trajectory_sft(f: Frame, n_points: int = TRAJ_N_POINTS,
     if gate_direction is not None:
         out["gate_direction"] = GATE_LABEL[gate_direction]
     parts = _reasoning_parts(f)                          # {spatial?,decision?,counterfactual?} 있는 것만
+    # keyframe(논문 정렬): Driving decision이 채워진 프레임(0.2Hz, 클립당 3개=50/100/150). 논문은 planning을
+    #   "decision-critical keyframe"에서 평가한다 → 평가를 이 프레임만으로 제한하는 --keyframe-eval의 근거 플래그.
+    #   spatial-only 프레임(1Hz의 나머지 10개)은 keyframe=False. (학습은 두 밀도 모두 사용 — 밀도 자체는 데이터 고유.)
+    out["keyframe"] = "decision" in parts
     if parts:
         out["reasoning_parts"] = parts
         if "decision" in parts:                          # 하위호환: 기존 필드는 decision reasoning 유지
@@ -296,6 +303,7 @@ def frame_to_trajectory_sft(f: Frame, n_points: int = TRAJ_N_POINTS,
     return {
         "id": f.sample_id + "_tj",                       # driving/spatial 샘플과 id 충돌 방지
         "clip_token": f.clip_token,
+        "frame_index": f.frame_index,                    # clip 내 시간 순서(temporal-clip 시퀀스 정렬용)
         "task": "trajectory",                            # 궤적 planning 태스크(DiT + reasoning 공동)
         "images": _frame_images(f),
         "mission": f.mission_command,

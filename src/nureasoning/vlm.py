@@ -36,7 +36,7 @@ from __future__ import annotations
 # transformers 5.12.1이 qwen3_vl 아키텍처를 정식 지원(AutoModelForImageTextToText 매핑 포함).
 DEFAULT_MODEL = "Qwen/Qwen3-VL-2B-Instruct"
 # DEFAULT_MODEL = "Qwen/Qwen2.5-VL-3B-Instruct"  # 후보(대체본): 같은 Qwen-VL 계열, 3B QLoRA가 단일 24GB에 더 검증됨
-SEED = 1234 
+SEED = 12345 
 
 # 이미지 해상도 캡(학습·평가 공통). Qwen-VL은 max_pixels=N*28*28 → 이미지당 비전토큰 상한 제어.
 # 8뷰 + spatial 멀티태스크를 한 시퀀스에 넣으면 256예산은 단일 GPU(24GB) QLoRA에서 OOM →

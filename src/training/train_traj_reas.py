@@ -87,6 +87,29 @@ class TrajDataset:
         return [r["output"]["waypoints"] for r in self.records]
 
 
+# group_records_by_clip: trajectory 레코드를 clip_token별로 묶고 frame_index 오름차순 정렬한 clip 리스트 반환.
+#   temporal-clip(시퀀스) 경로가 clip 단위로 시간순 롤아웃하는 데 쓴다. frame_index가 없는 구버전 데이터는
+#   id의 "..._<frameidx>_tj"에서 복원(하위호환). 반환: [[rec0,rec1,...](clipA 시간순), [...](clipB), ...].
+def group_records_by_clip(records: list) -> list:
+    import re
+    by_clip: dict = {}
+    for r in records:
+        tok = r.get("clip_token", "?")
+        by_clip.setdefault(tok, []).append(r)
+
+    def _fidx(r):
+        fi = r.get("frame_index")
+        if fi is not None:
+            return fi
+        m = re.match(r".*_(\d+)_tj$", r.get("id", ""))
+        return int(m.group(1)) if m else 0
+
+    clips = []
+    for tok in sorted(by_clip):                            # clip_token 정렬 → 전 rank 동일 순서(샤딩 재현성)
+        clips.append(sorted(by_clip[tok], key=_fidx))
+    return clips
+
+
 # load_vlm: vlm_mode에 따라 VLM 로드/학습 구성.
 #   full   = bf16 전체 학습(gradient checkpointing). 논문 충실, 24GB OOM 위험.
 #   lora   = 4-bit QLoRA(어댑터만 학습). VLM도 학습하되 메모리 안전.
@@ -189,6 +212,63 @@ def rec_maneuver(rec: dict):
     return (rec.get("output") or {}).get("maneuver_lateral")
 
 
+# ─── selective-view 게이팅(gate_direction 기반 뷰 on/off, 폐루프용) ────────────────────────────
+# gate_views와 달리 **이산 방향 라벨**(0=straight/1=left/2=right)로 뷰를 켠다. 이 라벨의 출처는:
+#   학습: build_sft가 심은 gate_direction GT(과거 결정 이월, teacher-forcing).
+#   추론: 게이트가 이전 프레임에서 예측한 방향(진짜 폐루프).
+# direction=None(과거 관측 없음=clip 첫 구간)이면 안전하게 전 8뷰(baseline) 유지 — 아직 방향을 모르므로.
+def gate_views_by_direction(image_recs, direction):
+    """direction: 0=straight/1=left/2=right/None(전뷰). None이면 게이팅 안 함(전 8뷰)."""
+    if image_recs is None:
+        return None
+    if direction is None:                                # 방향 미상(첫 구간) → 안전하게 전뷰
+        return image_recs
+    keep = set(GATE_ALWAYS)
+    if direction == 1:                                   # left
+        keep |= set(GATE_LEFT)
+    elif direction == 2:                                 # right
+        keep |= set(GATE_RIGHT)
+    # direction==0(straight)면 전면 3뷰만
+    return [im for im in image_recs if im.get("view") in keep]
+
+
+def rec_gate_direction(rec: dict):
+    """레코드의 gate_direction(0/1/2, 과거 결정 이월 GT). 없으면 None."""
+    return (rec.get("output") or {}).get("gate_direction")
+
+
+# is_keyframe: 이 trajectory 레코드가 **decision 프레임**(0.2Hz, Driving decision 채워진 프레임, clip당 3개)인가.
+#   ① build_sft가 심은 output.keyframe 플래그 우선(신규 빌드). ② 없으면(기존 sft_v2) reasoning_parts.decision
+#   존재로 폴백 → **재빌드 없이도** 판정 가능(decision은 이 프레임에만 채워지므로 동치).
+#   ⚠️ 이건 "decision 프레임(3개)"이지 "평가용 keyframe"이 아니다 — 평가 채점 대상은 select_keyframe_ids로 좁힌다.
+def is_keyframe(rec: dict) -> bool:
+    out = rec.get("output") or {}
+    if "keyframe" in out:
+        return bool(out["keyframe"])
+    return bool((out.get("reasoning_parts") or {}).get("decision"))
+
+
+# select_keyframe_ids: **clip-그룹 단위**로 평가 채점 대상 keyframe을 고른다. 각 clip의 decision 프레임들
+#   (frame_index 오름차순)에서 **순서(ordinal)** select_idx에 해당하는 것만 골라 그 레코드 id 집합을 반환.
+#   순서 기반인 이유: 절대 frame_index가 clip마다 50/100/150 또는 51/101/151로 어긋나므로(1프레임 오프셋),
+#   "몇 번째 decision 프레임"으로 매칭해야 안전. 논문은 clip당 keyframe 1개 → select_idx=(1,)=정중앙(2번째)이
+#   정황상 최선. select_idx=(0,1,2)면 3개 전부(현재까지 동작). records=평가 대상 trajectory 레코드 전체.
+def select_keyframe_ids(records: list, select_idx=(0, 1, 2)) -> set:
+    from collections import defaultdict
+    byclip = defaultdict(list)
+    for r in records:
+        if is_keyframe(r):
+            byclip[r.get("clip_token")].append(r)
+    keep = set()
+    sel = set(select_idx)
+    for recs_c in byclip.values():
+        recs_c.sort(key=lambda r: (r.get("frame_index") is None, r.get("frame_index")))  # decision 프레임 시간순
+        for i, r in enumerate(recs_c):
+            if i in sel:                                   # i번째 decision 프레임만 채점 대상
+                keep.add(r["id"])
+    return keep
+
+
 # ─── reasoning 종류 선택(단계별 ablation: baseline→+spatial→+decision→+counterfactual) ──────────
 # build_sft가 궤적 샘플에 심은 output.reasoning_parts({spatial?,decision?,counterfactual?})에서 --reasoning-types로
 # 고른 종류만 하나의 텍스트로 합쳐 LM_loss 타깃으로 쓴다. 논문의 "all reasoning types 공동 supervision"을
@@ -271,6 +351,58 @@ def encode_condition(model, processor, image_recs: list, prompt: str, history_re
     # 반환: (pooled cond (hidden,), mem 시퀀스 (1,seq,hidden), mem_mask (1,seq)). cross_attn이면 mem 사용,
     #   구형이면 cond 사용. mem은 batch 차원 보존(sample/flow_loss가 그대로 받음). cond는 기존 계약대로 squeeze.
     return pooled.squeeze(0).float(), hs, amask
+
+
+# gate_closedloop_encode: 폐루프 추론(방법 A의 추론측) — 게이트 예측으로 뷰를 게이팅해 planning cond 생성.
+#   1) **전방 3뷰**로 VLM encode → cond_gate → 게이트가 방향 예측(argmax). 설계 취지(전방만 보고 판단)에 정합.
+#   2) 그 예측 방향으로 뷰 게이팅 → 다시 encode → planning용 (cond, mem, mem_mask) 반환.
+#   ⚠️ VLM forward 2회(전방3뷰 1 + 게이팅뷰 1). 진짜 배포 파이프라인과 동일(전방판단→뷰확장→planning).
+#   ⚠️ 학습은 게이팅된 cond로 게이트 CE를 걸므로(속도 우선), Pass1(전방3뷰)와 입력 분포가 약간 다르다(train/infer
+#      mismatch) — 게이트 정확도가 낮으면 이 지점을 재검토(학습도 전방3뷰 cond로 게이트 CE).
+#   반환: (cond(1,Dc) on device, mem, mem_mask, pred_dir(0/1/2), used_views(list[str])).
+@torch.no_grad()
+def gate_closedloop_encode(vlm, gate_mod, processor, rec, prompt, temporal_on, device):
+    # 1) 게이트 예측: **전방 3뷰**(GATE_ALWAYS)만으로 cond 얻어 방향 예측
+    front_imgs = gate_views_by_direction(rec["images"], 0)   # 0=straight → 전방 3뷰만
+    front_hist = gate_views_by_direction(history_for(rec, temporal_on), 0)
+    cvec0, mem0, mm0 = encode_condition(vlm, processor, front_imgs, prompt, front_hist)
+    cond0 = cvec0.unsqueeze(0).to(device)
+    pred_dir = int(gate_mod(cond0).argmax(-1).item())      # 0=straight/1=left/2=right
+    # 2) 예측 방향으로 뷰 게이팅. **straight(0)면 Pass1(전방3뷰)과 동일** → 재-encode 생략(74% 직진에서 큰 절감).
+    if pred_dir == 0:
+        cond, mem, mem_mask = cond0, mem0.to(device), mm0.to(device)
+        used_views = sorted(im["view"] for im in front_imgs)
+    else:
+        imgs = gate_views_by_direction(rec["images"], pred_dir)
+        hist = gate_views_by_direction(history_for(rec, temporal_on), pred_dir)
+        cvec, mem, mem_mask = encode_condition(vlm, processor, imgs, prompt, hist)
+        cond = cvec.unsqueeze(0).to(device); mem = mem.to(device); mem_mask = mem_mask.to(device)
+        used_views = sorted(im["view"] for im in imgs)
+    return cond, mem, mem_mask, pred_dir, used_views
+
+
+# clip_closedloop_iter: temporal-clip 추론(진짜 폐루프, **Pass 구분 없음**). clip들을 시간 순서로 롤아웃하며
+#   각 프레임에서 (rec, cond, mem, mem_mask, pred_dir)를 yield한다. 프레임 t의 뷰는 **이전 프레임 게이트 예측
+#   dir(t-1)**로 게이팅(selective_view+gate), 첫 프레임은 전 8뷰. cond를 만든 그 게이트가 dir(t)를 예측해
+#   다음 프레임으로 전달 → VLM forward가 프레임당 1회(학습과 동일 구조). gate=None이면 게이팅 없이 전 8뷰.
+@torch.no_grad()
+def clip_closedloop_iter(vlm, gate, processor, clips, prompt_tpl, temporal_on, device, selective_view):
+    for clip_recs in clips:
+        prev_dir = None                                    # clip 시작: 과거 예측 없음 → 전 8뷰
+        for rec in clip_recs:
+            prompt = prompt_tpl.replace("{mission}", rec.get("mission") or "drive safely")
+            if selective_view and gate is not None:
+                imgs = gate_views_by_direction(rec["images"], prev_dir)
+                hist = gate_views_by_direction(history_for(rec, temporal_on), prev_dir)
+            else:
+                imgs = rec["images"]; hist = history_for(rec, temporal_on)
+            cvec, mem, mem_mask = encode_condition(vlm, processor, imgs, prompt, hist)
+            cond = cvec.unsqueeze(0).to(device); mem = mem.to(device); mem_mask = mem_mask.to(device)
+            pred_dir = None
+            if gate is not None:
+                pred_dir = int(gate(cond).argmax(-1).item())   # dir(t) 예측 → 다음 프레임 뷰용
+                prev_dir = pred_dir
+            yield rec, cond, mem, mem_mask, pred_dir
 
 
 # ego_vec: SFT 레코드의 ego_state([vx,vy,ax,ay] ego-frame)를 길이 ego_dim 리스트로(없으면 0). DiT의
@@ -356,7 +488,7 @@ class TrajTrainSet:
     dict를 돌려주는 map-style 데이터셋(DataLoader 워커에서 실행). torch.utils.data.Dataset을 상속하지
     않아도 __len__/__getitem__만 있으면 DataLoader가 받는다."""
     def __init__(self, records, processor, prompt_tpl, temporal_on, reasoning_types, joint, ego_dim,
-                 maneuver_thr=-1.0):
+                 maneuver_thr=-1.0, gate_teacher_forcing=False):
         self.records = records
         self.processor = processor
         self.prompt_tpl = prompt_tpl
@@ -365,6 +497,10 @@ class TrajTrainSet:
         self.joint = joint
         self.ego_dim = ego_dim
         self.maneuver_thr = maneuver_thr                   # selective-view 게이팅 임계값(<0=off, 전 8뷰)
+        # gate_teacher_forcing=True(--gate-weight>0): maneuver_thr(미래 GT) 대신 gate_direction GT(과거 결정
+        #   이월값)로 뷰 게이팅. 방법 A — "완벽한 과거 게이트 예측"으로 뷰 결정(teacher-forcing). 추론 땐 게이트
+        #   실제 예측을 씀(진짜 폐루프). 이 플래그가 True면 maneuver_thr 게이팅은 무시된다.
+        self.gate_teacher_forcing = gate_teacher_forcing
 
     def __len__(self):
         return len(self.records)
@@ -373,9 +509,14 @@ class TrajTrainSet:
         rec = self.records[i]
         prompt = self.prompt_tpl.replace("{mission}", rec.get("mission") or "drive safely")
         reasoning = reasoning_target(rec, self.reasoning_types) if self.joint else None  # 선택 종류 합친 LM 타깃
-        ml = rec_maneuver(rec)                              # 기동 신호(궤적 유도)
-        imgs = gate_views(rec["images"], ml, self.maneuver_thr)              # 현재뷰 게이팅
-        hist = gate_views(history_for(rec, self.temporal_on), ml, self.maneuver_thr)  # 과거뷰도 동일 게이팅
+        if self.gate_teacher_forcing:                       # 폐루프 학습: gate_direction GT로 뷰 게이팅
+            gdir = rec_gate_direction(rec)                  # 0/1/2/None(첫 구간→전뷰)
+            imgs = gate_views_by_direction(rec["images"], gdir)
+            hist = gate_views_by_direction(history_for(rec, self.temporal_on), gdir)
+        else:                                               # 구형: maneuver_lateral(미래 GT)+thr 게이팅
+            ml = rec_maneuver(rec)                          # 기동 신호(궤적 유도)
+            imgs = gate_views(rec["images"], ml, self.maneuver_thr)              # 현재뷰 게이팅
+            hist = gate_views(history_for(rec, self.temporal_on), ml, self.maneuver_thr)  # 과거뷰도 동일 게이팅
         enc, labels, plen = build_model_inputs(self.processor, imgs, prompt, reasoning, hist)
         ego = torch.tensor(ego_vec(rec, self.ego_dim), dtype=torch.float32) if self.ego_dim > 0 else None
         return {
@@ -520,6 +661,74 @@ class TrajReasVLA(nn.Module):
                 (gate_ce.detach() if gate_ce is not None else None))
 
 
+# ─── clip 시퀀스 롤아웃(temporal-clip 경로) ─────────────────────────────────────────────
+# clip_rollout_forward: 한 clip의 프레임을 **시간 순서로** 롤아웃. **프레임마다 즉시 backward**해
+#   그래프를 해제한다 — 뷰 게이팅 방향은 .item()/GT라 프레임 간 grad 연결이 없으므로(각 프레임 손실이 독립
+#   그래프) 안전하고, clip 전체 그래프를 동시 보유하지 않아 메모리 효율적(13프레임 동시 보유 시 OOM 회피).
+#   뷰 게이팅(selective_view일 때만; 아니면 항상 전 8뷰) — forcing으로 **게이팅 방향의 출처**가 갈린다:
+#     • student(폐루프): 프레임 t 뷰 = **이전 프레임 게이트 예측 dir(t-1)**(argmax, detach). 추론과 동일 분포
+#       (exposure-bias 없음)지만, 게이트가 나쁘면 틀린 뷰로 학습돼 붕괴가 자기강화될 수 있다. 첫 프레임=전 8뷰.
+#     • teacher: 프레임 t 뷰 = **그 프레임의 GT gate_direction**(rec_gate_direction). 프레임 간 의존성 없음
+#       (입력 독립) → 게이트/planning이 항상 올바른 뷰로 학습돼 안정적. GT 없는 프레임(예: 0~49)은 전 8뷰.
+#   각 프레임 t: 뷰 결정 → VLM forward(grad는 train_vlm이면 흐름) → cond/mem → flow + λ·LM + μ·gate_CE(항상
+#     현재 프레임 gate_direction GT로 지도) → backward(로컬 누적, sync는 호출측이 clip 경계에서 ddp.sync_grads).
+#     ⚠️ gate_CE 지도는 두 forcing 모두 GT 대비 동일; forcing은 오직 **뷰 게이팅 방향의 출처**만 바꾼다.
+#   backward 스케일 = grad_scale(=1/grad_accum). clip은 프레임 손실 **합**으로 기여(≈프레임 수만큼 큰 배치).
+#   반환: stats(로깅용, grad는 이미 파라미터 .grad에 누적됨).
+def clip_rollout_forward(vlm, dit, gate, normalizer, processor, prompt_tpl, clip_recs, device, grad_scale,
+                         *, train_vlm, joint, reasoning_types, ego_dim, temporal_on,
+                         reas_weight, gate_weight, gate_alpha, gate_focal_gamma, selective_view,
+                         forcing="student"):
+    import torch
+
+    if gate_alpha is not None:
+        gate_alpha = gate_alpha.to(device)     # 원본은 CPU(rank 공유) → 이 rank GPU로(focal_loss device 일치)
+    prev_dir = None                                        # 첫 프레임: 과거 게이트 예측 없음 → 전 8뷰
+    n = 0
+    flow_sum = lm_sum = gate_sum = 0.0
+    lm_n = gate_n = 0
+    ctx = nullcontext() if train_vlm else torch.no_grad()
+    for rec in clip_recs:
+        prompt = prompt_tpl.replace("{mission}", rec.get("mission") or "drive safely")
+        reasoning = reasoning_target(rec, reasoning_types) if joint else None
+        # 뷰 게이팅 방향: student=prev_dir(t-1 예측), teacher=현재 프레임 GT gate_direction. 아니면 전 8뷰.
+        #   history도 동일 방향으로 게이팅. teacher는 GT가 None(예: 0~49)이면 gate_views_by_direction이 전 8뷰.
+        if selective_view:
+            gate_dir = rec_gate_direction(rec) if forcing == "teacher" else prev_dir
+            imgs = gate_views_by_direction(rec["images"], gate_dir)      # None→8뷰
+            hist = gate_views_by_direction(history_for(rec, temporal_on), gate_dir)
+        else:
+            imgs = rec["images"]
+            hist = history_for(rec, temporal_on)
+        with ctx:
+            cvec, lm_loss, hs, cmask = encode_and_lm_loss(vlm, processor, imgs, prompt, reasoning, hist)
+        cond = cvec.unsqueeze(0).to(device)                # (1, hidden)
+        ego = torch.tensor([ego_vec(rec, ego_dim)], dtype=torch.float32, device=device) if ego_dim > 0 else None
+        x1 = normalizer.normalize(torch.tensor([rec["output"]["waypoints"]], dtype=torch.float32, device=device))
+        flow = dit.flow_loss(x1, cond, ego, mem=hs.to(device), mem_mask=cmask.to(device))
+        frame_loss = flow
+        flow_sum += float(flow); n += 1
+        if lm_loss is not None:
+            frame_loss = frame_loss + reas_weight * lm_loss
+            lm_sum += float(lm_loss); lm_n += 1
+        # 게이트: 현재 프레임 gate_direction GT로 focal 지도 + 다음 프레임 뷰용 dir 예측
+        if gate is not None:
+            logits = gate(cond)                            # (1,3)
+            gd = rec_gate_direction(rec)
+            if gate_weight > 0 and gd is not None:
+                gce = focal_loss(logits, torch.tensor([gd], dtype=torch.long, device=device),
+                                 alpha=gate_alpha, gamma=gate_focal_gamma)
+                frame_loss = frame_loss + gate_weight * gce
+                gate_sum += float(gce); gate_n += 1
+            else:                                          # gate 라벨 없는 프레임: 0-더미로 head 그래프 유지
+                frame_loss = frame_loss + 0.0 * logits.float().mean()
+            prev_dir = int(logits.argmax(-1).item())       # 다음 프레임 뷰 게이팅용(폐루프, item()=detach)
+        (frame_loss * grad_scale).backward()               # 프레임별 즉시 backward → 그래프 해제(메모리 안전)
+    stats = {"n": n, "flow_sum": flow_sum, "lm_sum": lm_sum, "lm_n": lm_n,
+             "gate_sum": gate_sum, "gate_n": gate_n}
+    return stats
+
+
 # evaluate: val의 trajectory 샘플에 대해 학습과 동일 손실(flow + λ·LM)을 grad 없이 계산해 평균 반환.
 #   학습 중 epoch 종합 지표용(가벼운 val loss). ADE/FDE 같은 궤적 지표는 eval_trajectory.py로 별도.
 #   **분산 eval**: val을 rank별로 샤딩해 병렬 forward 후, 부분합/부분개수를 all_reduce(SUM)해 전 rank
@@ -527,17 +736,20 @@ class TrajReasVLA(nn.Module):
 #   데드락 없음). 반환: {"val_loss","val_flow","val_lm"} (전 rank reasoning 샘플 0이면 val_lm 생략).
 def evaluate(vlm, dit_mod, processor, val_records, prompt_tpl, normalizer, reas_weight, device, joint,
              temporal_on=False, reasoning_types=(), maneuver_thr=-1.0,
-             gate_mod=None, gate_weight=0.0, gate_alpha=None, gate_focal_gamma=2.0):
+             gate_mod=None, gate_weight=0.0, gate_alpha=None, gate_focal_gamma=2.0,
+             temporal_clip=False, selective_view=False, forcing="student", keyframe_eval=False,
+             keyframe_select=(0, 1, 2)):
     import torch
 
     was_training = dit_mod.training
+    # 채점 대상 keyframe id 집합(clip당 decision 프레임 중 select된 순서만). keyframe_eval off면 미사용.
+    kf_ids = select_keyframe_ids(val_records, keyframe_select) if keyframe_eval else None
     dit_mod.eval()
     gate_was_training = gate_mod.training if gate_mod is not None else None
     if gate_mod is not None:
         gate_mod.eval()
     if gate_alpha is not None:
         gate_alpha = gate_alpha.to(device)     # 각 rank가 자기 GPU로(원본은 CPU에 둬 rank 간 공유 텐서 재사용)
-    my = ddp.shard(list(range(len(val_records))))         # 이 rank가 맡을 val 인덱스
     flow_sum = tot_sum = lm_sum = 0.0
     n = lm_n = 0
     gate_ce_sum = gate_n = 0.0
@@ -545,38 +757,100 @@ def evaluate(vlm, dit_mod, processor, val_records, prompt_tpl, normalizer, reas_
     # 클래스별 (correct, total) — 안전 지표: left/right(측면 뷰 필요) 재현율을 특히 확인.
     gate_cls_correct = {0: 0.0, 1: 0.0, 2: 0.0}
     gate_cls_total = {0: 0.0, 1: 0.0, 2: 0.0}
+
+    # _accum_loss: 한 프레임의 (cond, lml)로 flow/lm/gate_ce **손실만** 집계(val_loss = 학습과 동일 게이팅
+    #   기준이어야 학습 신호와 일관). gate 예측(pred_dir)은 반환하되 정확도 집계는 여기서 하지 않는다
+    #   — teacher forcing이면 cond가 GT로 게이팅돼 pred_dir 예측 자체가 leakage(자기 게이팅을 되읽음)라
+    #   정확도 지표로 쓰면 안 되기 때문. 정확도는 항상 별도의 closed-loop cond로 _accum_gate_metrics가 잰다.
+    def _accum_loss(rec, cond, mem, mem_mask, lml):
+        nonlocal flow_sum, tot_sum, lm_sum, n, lm_n, gate_ce_sum, gate_n
+        ego = torch.tensor([ego_vec(rec, dit_mod.ego_dim)], dtype=torch.float32, device=device) \
+            if dit_mod.ego_dim > 0 else None
+        x1 = normalizer.normalize(torch.tensor([rec["output"]["waypoints"]], dtype=torch.float32, device=device))
+        flow = float(dit_mod.flow_loss(x1, cond, ego, mem=mem, mem_mask=mem_mask))
+        tot = flow + reas_weight * float(lml) if lml is not None else flow
+        pred_dir = None
+        if gate_mod is not None:
+            logits = gate_mod(cond)
+            pred_dir = int(logits.argmax(-1).item())
+            gd = rec["output"].get("gate_direction")
+            if gd is not None:
+                ce = float(focal_loss(logits, torch.tensor([gd], device=device),
+                                      alpha=gate_alpha, gamma=gate_focal_gamma))
+                tot = tot + gate_weight * ce
+                gate_ce_sum += ce; gate_n += 1
+        flow_sum += flow; tot_sum += tot; n += 1
+        if lml is not None:
+            lm_sum += float(lml); lm_n += 1
+        return pred_dir
+
+    # _accum_gate_metrics: **항상 closed-loop(예측 게이팅) cond**의 게이트 예측으로 acc/recall만 집계.
+    #   forcing과 무관 — teacher든 student든 이 cond는 예측 방향으로 게이팅돼 GT 누출이 없다(inference 진실).
+    def _accum_gate_metrics(rec, cond):
+        nonlocal gate_correct
+        if gate_mod is None:
+            return None
+        logits = gate_mod(cond)
+        pred_dir = int(logits.argmax(-1).item())
+        gd = rec["output"].get("gate_direction")
+        if gd is not None:
+            gate_cls_total[gd] += 1
+            if pred_dir == gd:
+                gate_correct += 1; gate_cls_correct[gd] += 1
+        return pred_dir
+
     with torch.no_grad():
-        for i in my:
-            rec = val_records[i]
-            prompt = prompt_tpl.replace("{mission}", rec.get("mission") or "drive safely")
-            reasoning = reasoning_target(rec, reasoning_types) if joint else None
-            ml = rec_maneuver(rec)                          # 학습과 동일 게이팅으로 val_loss 측정(일관)
-            imgs = gate_views(rec["images"], ml, maneuver_thr)
-            c, lml, mem, mem_mask = encode_and_lm_loss(vlm, processor, imgs, prompt, reasoning,
-                                                       gate_views(history_for(rec, temporal_on), ml, maneuver_thr))
-            cond = c.unsqueeze(0).to(device)
-            mem = mem.to(device); mem_mask = mem_mask.to(device)
-            ego = torch.tensor([ego_vec(rec, dit_mod.ego_dim)], dtype=torch.float32, device=device) \
-                if dit_mod.ego_dim > 0 else None
-            x1 = torch.tensor([rec["output"]["waypoints"]], dtype=torch.float32, device=device)
-            x1 = normalizer.normalize(x1)
-            flow = float(dit_mod.flow_loss(x1, cond, ego, mem=mem, mem_mask=mem_mask))
-            tot = flow + reas_weight * float(lml) if lml is not None else flow
-            if gate_mod is not None:
-                gd = rec["output"].get("gate_direction")
-                if gd is not None:
-                    logits = gate_mod(cond)                              # (1,3)
-                    lbl = torch.tensor([gd], device=device)
-                    ce = float(focal_loss(logits, lbl, alpha=gate_alpha, gamma=gate_focal_gamma))
-                    tot = tot + gate_weight * ce
-                    gate_ce_sum += ce; gate_n += 1
-                    pred = int(logits.argmax(-1).item())
-                    gate_cls_total[gd] += 1
-                    if pred == gd:
-                        gate_correct += 1; gate_cls_correct[gd] += 1
-            flow_sum += flow; tot_sum += tot; n += 1
-            if lml is not None:
-                lm_sum += float(lml); lm_n += 1
+        if temporal_clip:
+            # clip 순차 폐루프 val(학습과 동일 구조): clip을 rank별 샤딩, dir(t-1) 예측으로 뷰 게이팅.
+            clips = group_records_by_clip(val_records)
+            my_clip_idx = ddp.shard(list(range(len(clips))))
+            for ci in my_clip_idx:
+                prev_dir = None
+                for rec in clips[ci]:
+                    # keyframe_eval: 전 프레임을 롤아웃(prev_dir 폐루프 유지)하되 **선택된 keyframe만 채점**(논문 정렬).
+                    kf = (not keyframe_eval) or (rec["id"] in kf_ids)
+                    prompt = prompt_tpl.replace("{mission}", rec.get("mission") or "drive safely")
+                    reasoning = reasoning_target(rec, reasoning_types) if joint else None
+                    # val_loss는 학습과 동일 게이팅: student=prev_dir(폐루프), teacher=현재 GT.
+                    if selective_view and gate_mod is not None:
+                        gate_dir = rec_gate_direction(rec) if forcing == "teacher" else prev_dir
+                        imgs = gate_views_by_direction(rec["images"], gate_dir)
+                        hist = gate_views_by_direction(history_for(rec, temporal_on), gate_dir)
+                    else:
+                        imgs = rec["images"]; hist = history_for(rec, temporal_on)
+                    c, lml, mem, mem_mask = encode_and_lm_loss(vlm, processor, imgs, prompt, reasoning, hist)
+                    cond = c.unsqueeze(0).to(device)
+                    if kf:                                 # 손실은 keyframe만 집계
+                        _accum_loss(rec, cond, mem.to(device), mem_mask.to(device), lml)
+                    # 게이트: prev_dir 갱신은 **매 프레임**(폐루프), 정확도 지표는 keyframe만. 정확도는 forcing과
+                    #   무관하게 항상 closed-loop(예측 게이팅) cond로 측정(leakage 방지) — teacher면 prev_dir로 재-encode.
+                    if gate_mod is not None:
+                        if forcing == "teacher" and selective_view:
+                            imgs_cl = gate_views_by_direction(rec["images"], prev_dir)
+                            hist_cl = gate_views_by_direction(history_for(rec, temporal_on), prev_dir)
+                            c_cl, _, _, _ = encode_and_lm_loss(vlm, processor, imgs_cl, prompt, None, hist_cl)
+                            cond_cl = c_cl.unsqueeze(0).to(device)
+                        else:
+                            cond_cl = cond
+                        pd = _accum_gate_metrics(rec, cond_cl) if kf \
+                            else int(gate_mod(cond_cl).argmax(-1).item())
+                        prev_dir = pd                      # 다음 프레임 closed-loop 게이팅용(매 프레임 갱신)
+        else:
+            # 프레임 독립 경로: keyframe_eval이면 선택된 keyframe만 남겨 샤딩(rank 부하 균형 + 채점 대상 일치).
+            idxs = [i for i in range(len(val_records))
+                    if (not keyframe_eval) or (val_records[i]["id"] in kf_ids)]
+            my = ddp.shard(idxs)                              # 이 rank가 맡을 val 인덱스(프레임 독립)
+            for i in my:
+                rec = val_records[i]
+                prompt = prompt_tpl.replace("{mission}", rec.get("mission") or "drive safely")
+                reasoning = reasoning_target(rec, reasoning_types) if joint else None
+                ml = rec_maneuver(rec)                       # 학습과 동일(구형) 게이팅으로 val_loss 측정
+                imgs = gate_views(rec["images"], ml, maneuver_thr)
+                c, lml, mem, mem_mask = encode_and_lm_loss(vlm, processor, imgs, prompt, reasoning,
+                                                           gate_views(history_for(rec, temporal_on), ml, maneuver_thr))
+                cond = c.unsqueeze(0).to(device)
+                _accum_loss(rec, cond, mem.to(device), mem_mask.to(device), lml)
+                _accum_gate_metrics(rec, cond)     # (구형 경로) GT-direction 게이팅이 아니라 leakage 없음
     if was_training:
         dit_mod.train()
     if gate_mod is not None and gate_was_training:
@@ -593,7 +867,9 @@ def evaluate(vlm, dit_mod, processor, val_records, prompt_tpl, normalizer, reas_
     if g_lm_n > 0:
         out["val_lm"] = g_lm / g_lm_n
     if g_gate_n > 0:
-        out["val_gate_ce"] = g_gate_ce / g_gate_n
+        out["val_gate_ce"] = g_gate_ce / g_gate_n          # 손실(_accum_loss, 학습과 동일 게이팅)
+        # 정확도(_accum_gate_metrics, 항상 closed-loop 게이팅 — leakage 없음). g_gate_n과 분모가 같은 이유:
+        # 두 함수 모두 프레임마다 정확히 1번씩, 같은 gate_direction is not None 조건으로 카운트하므로 항상 동수.
         out["val_gate_acc"] = g_gate_correct / g_gate_n
         # 안전 지표: left/right(측면 뷰 필요) 재현율 — 이게 낮으면 게이트가 방향 전환을 놓쳐 뷰를 못 킴.
         if g_t1 > 0:
@@ -607,7 +883,7 @@ def evaluate(vlm, dit_mod, processor, val_records, prompt_tpl, normalizer, reas_
 # 재사용(재로딩 없음)해 ① ADE/FDE(미터, eval_trajectory와 동일 계산) + ② BEV 시각화/8뷰/reasoning을
 # run_dir에 저장한다. eval 스크립트의 재사용 함수(displacement/constant_velocity/plot_grid/...)를 import.
 def run_final_eval(vlm_mod, dit_mod, processor, normalizer, cfg, prompt_tpl, device,
-                   out_dir, val_path, ade_limit, tag="trajectory", viz_n=18, per_page=6):
+                   out_dir, val_path, ade_limit, tag="trajectory", viz_n=18, per_page=6, gate_mod=None):
     import numpy as np
     import torch
 
@@ -636,40 +912,120 @@ def run_final_eval(vlm_mod, dit_mod, processor, normalizer, cfg, prompt_tpl, dev
     infer_times_ms = []
     ade_recs = recs[:ade_limit] if ade_limit else recs
     rows, ades, fdes, cv_ades, cv_fdes, plan_rows = [], [], [], [], [], []
+    gate_correct = 0; gate_total = 0                          # 폐루프 게이트 예측 정확도(gate_direction GT 대비)
+    temporal_clip = cfg.get("temporal_clip", False)
+    selective_view = cfg.get("selective_view", False)
+    keyframe_eval = cfg.get("keyframe_eval", False)           # 논문 정렬: keyframe(decision, 0.2Hz)만 채점
+    keyframe_select = tuple(cfg.get("keyframe_select", [1]))   # clip당 decision 3개 중 채점 순서(기본 [1]=정중앙)
+    kf_ids = select_keyframe_ids(ade_recs, keyframe_select) if keyframe_eval else None
+
+    # ── 속도 계측 원칙(편차·공정성 수정): "추론"만 계측한다.
+    #   계측 대상 = VLM encode(게이팅된 뷰) + DiT sample. 이 둘이 실제 온라인 추론에서 실행되는 계산이며,
+    #     selective-view의 뷰 개수(3 vs 8) 효과가 여기서 드러난다. 두 경로(temporal_clip/일반) 동일 기준.
+    #   계측 제외 = planning_scores(BEV 충돌·맵 numpy CPU 계산) + denorm + ADE/FDE 집계. 이건 오프라인 평가지표
+    #     계산이지 추론이 아니며, 장면 객체 수·맵 복잡도에 따라 크게 변동해 fastest/slowest 편차의 주범이었다.
+    #   ⇒ _infer(계측 안, sample만) / _accum(계측 밖, scoring)로 분리하고, encode도 계측 구간 안으로 넣는다.
+
+    def _infer(rec, cond, mem, mem_mask):
+        ego = torch.tensor([ego_vec(rec, dit_mod.ego_dim)], dtype=torch.float32, device=device) \
+            if dit_mod.ego_dim > 0 else None
+        return dit_mod.sample(cond, steps=ode_steps, deterministic=True, ego=ego,
+                              mem=mem, mem_mask=mem_mask)[0]
+
+    # _accum: 계측 밖. denorm + ADE/FDE + planning 점수 집계(공통 tail). pred_dir 있으면 gate 정확도.
+    def _accum(rec, pred_norm, pred_dir):
+        nonlocal gate_correct, gate_total
+        if pred_dir is not None:
+            gd = rec_gate_direction(rec)
+            if gd is not None:
+                gate_total += 1; gate_correct += int(pred_dir == gd)
+        pred_wp = normalizer.denormalize(pred_norm.cpu()).numpy()
+        gt_wp = np.asarray(rec["output"]["waypoints"])
+        pred = upsample_waypoints(pred_wp); gt = upsample_waypoints(gt_wp)   # (51,2) @10Hz
+        ade, fde = displacement_errors(pred, gt)
+        cv_ade, cv_fde = displacement_errors(constant_velocity(gt), gt)
+        ades.append(ade); fdes.append(fde); cv_ades.append(cv_ade); cv_fdes.append(cv_fde)
+        ps = planning_scores(rec, pred, gt)
+        plan_rows.append(ps)
+        rows.append({"id": rec["id"], "ade": round(ade, 3), "fde": round(fde, 3),
+                     "cv_ade": round(cv_ade, 3), "cv_fde": round(cv_fde, 3),
+                     **{k: round(v, 3) for k, v in ps.items()},
+                     "pred_final": [round(float(x), 2) for x in pred[-1]],
+                     "gt_final": [round(float(x), 2) for x in gt[-1]]})
+
+    # ── 예열(warmup) 2-패스 계측: pass0=warmup(통계·집계 제외), pass1=측정.
+    #   왜? encode 안(_append_views)에서 8뷰를 디스크에서 로드한다 → 콜드 캐시면 read가 수백 ms 튄다.
+    #   특히 temporal_clip은 clip 단위 재정렬로 **clip 경계 첫 프레임마다** 콜드 read가 생겨 slowest가 튄다
+    #   (실배포엔 없는 디스크 I/O·일회성 비용). 예열 패스가 페이지캐시·GPU allocator(3/6/8뷰 텐서 크기)·
+    #   cuDNN autotune을 모두 데워서, 측정 패스는 순수 compute(encode+sample) tail만 남긴다 → 두 모드 공정 비교.
+    #   비용: 최종평가 1회에 한해 encode+sample을 2배 수행(미니 val 규모라 수용 가능).
     with torch.no_grad():
-        for i, rec in enumerate(ade_recs, 1):
-            prompt = prompt_tpl.replace("{mission}", rec.get("mission") or "drive safely")
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            _ml = rec_maneuver(rec)
-            cvec, mem, mem_mask = encode_condition(vlm_mod, processor,
-                                                   gate_views(rec["images"], _ml, man_thr), prompt,
-                                                   gate_views(history_for(rec, temporal_on), _ml, man_thr))
-            cond = cvec.unsqueeze(0).to(device); mem = mem.to(device); mem_mask = mem_mask.to(device)
-            ego = torch.tensor([ego_vec(rec, dit_mod.ego_dim)], dtype=torch.float32, device=device) \
-                if dit_mod.ego_dim > 0 else None
-            pred_norm = dit_mod.sample(cond, steps=ode_steps, deterministic=True, ego=ego,
-                                       mem=mem, mem_mask=mem_mask)[0]
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            if i > 1:                                       # 첫 샘플=워밍업 → 통계 제외
-                infer_times_ms.append((time.perf_counter() - t0) * 1000.0)
-            pred_wp = normalizer.denormalize(pred_norm.cpu()).numpy()
-            gt_wp = np.asarray(rec["output"]["waypoints"])    # (T,3) [fwd,left,θ] @2Hz
-            # 논문 ADE: 예측/GT를 Δt=0.1s(10Hz)로 51 poses(현재 pose 포함) 보간 후 평가(planning_metrics도 10Hz 가정).
-            pred = upsample_waypoints(pred_wp)                # (51,2) [fwd,left] @10Hz
-            gt = upsample_waypoints(gt_wp)                    # (51,2)
-            ade, fde = displacement_errors(pred, gt)
-            cv_ade, cv_fde = displacement_errors(constant_velocity(gt), gt)
-            ades.append(ade); fdes.append(fde); cv_ades.append(cv_ade); cv_fdes.append(cv_fde)
-            ps = planning_scores(rec, pred, gt)               # NC/DA/EP/CF/HL/NPS(맵·객체 기반, 10Hz)
-            plan_rows.append(ps)
-            rows.append({"id": rec["id"], "ade": round(ade, 3), "fde": round(fde, 3),
-                         "cv_ade": round(cv_ade, 3), "cv_fde": round(cv_fde, 3),
-                         **{k: round(v, 3) for k, v in ps.items()},
-                         "pred_final": [round(float(x), 2) for x in pred[-1]],
-                         "gt_final": [round(float(x), 2) for x in gt[-1]]})
+        if temporal_clip:
+            # 진짜 폐루프(Pass 구분 없음): clip 시간순 롤아웃, dir(t-1) 게이트 예측으로 프레임 t 뷰 게이팅.
+            #   encode를 iterator 밖(여기 계측 구간)에서 직접 실행해야 뷰 개수 효과가 계측에 잡힌다.
+            #   keyframe_eval: 전 프레임 롤아웃(prev_dir 폐루프 유지)하되 **keyframe만 계측·집계**. 비-keyframe은
+            #   prev_dir 갱신용 encode+gate만(sample·계측 없음) → 논문식 "keyframe planning 평가".
+            clips = group_records_by_clip(ade_recs)
+            for warmup in (True, False):                        # pass0=예열(집계 제외), pass1=측정
+                scored = 0                                     # 채점(keyframe) 프레임 수(첫 채점=워밍업 보수 제외)
+                for clip_recs in clips:
+                    prev_dir = None                            # clip 시작: 과거 예측 없음 → 전 8뷰
+                    for rec in clip_recs:
+                        prompt = prompt_tpl.replace("{mission}", rec.get("mission") or "drive safely")
+                        if selective_view and gate_mod is not None:
+                            imgs = gate_views_by_direction(rec["images"], prev_dir)
+                            hist = gate_views_by_direction(history_for(rec, temporal_on), prev_dir)
+                        else:
+                            imgs = rec["images"]; hist = history_for(rec, temporal_on)
+                        if keyframe_eval and rec["id"] not in kf_ids:
+                            # 비-채점 프레임: prev_dir 갱신만(폐루프), 계측·sample·집계 없음
+                            if gate_mod is not None:
+                                cvec, _m, _mm = encode_condition(vlm_mod, processor, imgs, prompt, hist)
+                                prev_dir = int(gate_mod(cvec.unsqueeze(0).to(device)).argmax(-1).item())
+                            continue
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        t0 = time.perf_counter()               # ── 계측 시작: encode + sample
+                        cvec, mem, mem_mask = encode_condition(vlm_mod, processor, imgs, prompt, hist)
+                        cond = cvec.unsqueeze(0).to(device); mem = mem.to(device); mem_mask = mem_mask.to(device)
+                        pred_dir = None
+                        if gate_mod is not None:
+                            pred_dir = int(gate_mod(cond).argmax(-1).item())   # dir(t) 예측 → 다음 프레임 뷰용
+                            prev_dir = pred_dir
+                        pred_norm = _infer(rec, cond, mem, mem_mask)
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        if not warmup:                         # 예열 패스는 계측·집계 안 함
+                            scored += 1
+                            if scored > 1:                     # ── 계측 끝(측정패스 첫 채점도 보수적 제외)
+                                infer_times_ms.append((time.perf_counter() - t0) * 1000.0)
+                            _accum(rec, pred_norm, pred_dir)   # ── 계측 밖: 지표 집계
+        else:
+            # 프레임 독립: keyframe_eval이면 선택된 keyframe만 채점(prev_dir 의존 없어 upfront 필터).
+            scored_recs = [r for r in ade_recs if (not keyframe_eval) or (r["id"] in kf_ids)]
+            for warmup in (True, False):                        # pass0=예열(집계 제외), pass1=측정
+                for i, rec in enumerate(scored_recs, 1):
+                    prompt = prompt_tpl.replace("{mission}", rec.get("mission") or "drive safely")
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t0 = time.perf_counter()                   # ── 계측 시작: encode + sample
+                    if gate_mod is not None:                  # (구형 Pass 게이팅) 전방3뷰 예측→뷰게이팅
+                        cond, mem, mem_mask, pred_dir, _uv = gate_closedloop_encode(
+                            vlm_mod, gate_mod, processor, rec, prompt, temporal_on, device)
+                    else:                                     # (구형) maneuver_lateral(미래 GT)+thr 게이팅
+                        pred_dir = None
+                        _ml = rec_maneuver(rec)
+                        cvec, mem, mem_mask = encode_condition(vlm_mod, processor,
+                                                               gate_views(rec["images"], _ml, man_thr), prompt,
+                                                               gate_views(history_for(rec, temporal_on), _ml, man_thr))
+                        cond = cvec.unsqueeze(0).to(device); mem = mem.to(device); mem_mask = mem_mask.to(device)
+                    pred_norm = _infer(rec, cond, mem, mem_mask)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    if not warmup:                             # 예열 패스는 계측·집계 안 함
+                        if i > 1:                              # ── 계측 끝(측정패스 1번째도 보수적 제외)
+                            infer_times_ms.append((time.perf_counter() - t0) * 1000.0)
+                        _accum(rec, pred_norm, pred_dir)       # ── 계측 밖: 지표 집계
     plan_agg = aggregate(plan_rows)                            # 각 지표 nanmean + NPS 유효 표본 수
     # 속도 통계(ms, 워밍업 제외): fastest=최솟값, slowest=최댓값, median=중앙값, mean=산술평균.
     t_sorted = sorted(infer_times_ms)
@@ -680,17 +1036,23 @@ def run_final_eval(vlm_mod, dit_mod, processor, normalizer, cfg, prompt_tpl, dev
                       "median_ms": round(median_ms, 2), "mean_ms": round(sum(t_sorted) / n_t, 2)}
     else:
         speed_stats = {"n_timed": 0, "fastest_ms": None, "slowest_ms": None, "median_ms": None, "mean_ms": None}
-    metrics = {"n_samples": len(ade_recs), "model": cfg["model"],
+    n_scored = len(ades)                                     # 실제 채점 표본 수(keyframe_eval이면 keyframe만)
+    metrics = {"n_samples": n_scored, "n_recs": len(ade_recs), "keyframe_eval": keyframe_eval,
+               "keyframe_select": list(keyframe_select), "model": cfg["model"],
                "ADE_mean": round(float(np.mean(ades)), 3), "FDE_mean": round(float(np.mean(fdes)), 3),
                "ADE_baseline_cv": round(float(np.mean(cv_ades)), 3),
                "FDE_baseline_cv": round(float(np.mean(cv_fdes)), 3), "ode_steps": ode_steps,
                "maneuver_lateral_thr": man_thr, "inference_speed_ms": speed_stats,
                **plan_agg}                                     # NC_mean..NPS_mean, n_nps
+    if gate_mod is not None:                                  # 폐루프 게이트 예측 정확도(gate_direction GT 대비)
+        metrics["gate_closedloop"] = True
+        metrics["gate_pred_acc"] = round(gate_correct / gate_total, 3) if gate_total else None
     (out_dir / f"{tag}_metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2))
     # Table 3 스타일 블록을 콘솔에 출력(rank0). 높을수록 좋음(ADE만 미터·낮을수록 좋음).
-    print(f"\n=== planning metrics (nuReasoning Table 3 style, 5s horizon, n={len(ade_recs)}) ===")
+    _kf = " [keyframe-only]" if keyframe_eval else ""
+    print(f"\n=== planning metrics (nuReasoning Table 3 style, 5s horizon, n={n_scored}{_kf}) ===")
     print(format_table(plan_agg, ade=metrics["ADE_mean"]))
-    print(f"(NPS 유효 표본 {plan_agg.get('n_nps', 0)}/{len(ade_recs)}; 미니 근사 — planning_metrics.py 주석 참고)\n")
+    print(f"(NPS 유효 표본 {plan_agg.get('n_nps', 0)}/{n_scored}; 미니 근사 — planning_metrics.py 주석 참고)\n")
     print(f"=== inference speed (ms/sample, VLM encode + DiT sample, n={speed_stats['n_timed']}, "
           f"1번째 워밍업 제외, selective-view thr={man_thr}) ===")
     if speed_stats["n_timed"]:
@@ -822,6 +1184,32 @@ def main() -> None:
     ap.add_argument("--gate-focal-gamma", dest="gate_focal_gamma", type=float, default=2.0,
                     help="게이트 focal loss의 감쇠 지수 γ(Lin et al. 2017). 0=순수 class-weighted CE. "
                          "클수록 이미 잘 맞추는 다수클래스(직진) 손실을 더 강하게 억제해 소수클래스(좌/우)에 집중.")
+    ap.add_argument("--temporal-clip", dest="temporal_clip", action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help="clip 단위 시간순 시퀀스 학습/추론(진짜 폐루프). True면 프레임을 clip별 시간 순서로 롤아웃하며 "
+                         "**이전 프레임의 게이트 예측 dir(t-1)**로 현재 프레임 뷰를 게이팅(selective-view일 때). "
+                         "False면 기존 프레임 독립 경로(DataLoader 셔플). DDP는 clip 단위 샤딩.")
+    ap.add_argument("--selective-view", dest="selective_view", action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help="게이트 예측(dir(t-1))으로 현재 프레임 뷰를 실제로 게이팅할지. True=폐루프 뷰 선택(직진→전면3뷰, "
+                         "좌/우→방향3뷰 추가). False=항상 전 8뷰(게이트는 --gate-weight>0이면 학습만 되고 뷰 선택엔 미사용). "
+                         "3설정: baseline(--no-selective-view --gate-weight 0) / +decision(--no-selective-view --gate-weight 1) "
+                         "/ selective+decision(--selective-view --gate-weight 1). ⚠️ --temporal-clip와 함께 사용.")
+    ap.add_argument("--forcing", choices=["student", "teacher"], default="student",
+                    help="학습 시 뷰 게이팅 방향의 출처(--temporal-clip --selective-view에서만 유효). "
+                         "student(기본, 폐루프): 프레임 t 뷰를 게이트의 t-1 예측으로 게이팅 — 추론과 동일 분포지만 "
+                         "게이트가 나쁘면 붕괴 자기강화. teacher: 프레임 t 뷰를 그 프레임 GT gate_direction으로 게이팅 "
+                         "— 프레임 독립·항상 올바른 뷰로 학습해 안정적. ⚠️ 추론은 GT가 없어 항상 student 폐루프. "
+                         "--no-selective-view면 forcing 무관하게 항상 전 8뷰(순차 입력만 유지).")
+    ap.add_argument("--keyframe-eval", dest="keyframe_eval", action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help="(논문 정렬) 검증/최종평가를 **keyframe에서만** 채점. temporal-clip 폐루프는 전 프레임을 "
+                         "순차 롤아웃(prev_dir 유지)하되 선택된 keyframe에서만 ADE/planning·속도를 집계. 학습은 영향 "
+                         "없음(전 reasoning 프레임 사용). 기본 False(reasoning 프레임 전체에서 평가).")
+    ap.add_argument("--keyframe-select", dest="keyframe_select", default="1",
+                    help="--keyframe-eval 시 clip당 decision 프레임 3개 중 **순서(ordinal)**로 채점 대상 선택. "
+                         "0=첫째(~50), 1=정중앙(~100), 2=마지막(~150). 기본 '1'(정중앙=논문식 clip당 keyframe 1개). "
+                         "'0,1,2'=3개 전부. 절대 frame_index가 clip마다 50/100/150 또는 51/101/151로 어긋나 순서로 매칭.")
     ap.add_argument("--ego-state-token", dest="ego_state_token", action=argparse.BooleanOptionalAction,
                     default=True,
                     help="(기본 켜짐, 논문 nuVLA) ego(현재 dynamics + 이동 history)를 DiT **state token**으로 시퀀스에 "
@@ -833,7 +1221,7 @@ def main() -> None:
                     default=True,
                     help="(기본 켜짐) 학습 끝나면 ADE/FDE + BEV 시각화를 run_dir에 자동 저장. "
                          "--no-final-eval로 생략(smoke/디버그/GPU 빠듯할 때)")
-    ap.add_argument("--final-eval-limit", type=int, default=100,
+    ap.add_argument("--final-eval-limit", type=int, default=0,
                     help="최종 ADE/FDE 평가 샘플 수(0=전체)")
     ap.add_argument("--final-eval-viz", type=int, default=18,
                     help="최종 BEV/8뷰 시각화 장면 수(전체에서 균등 간격 선택)")
@@ -870,6 +1258,8 @@ def main() -> None:
     prompt_tpl = TRAJ_PROMPT_FILE.read_text()
     train_vlm = args.vlm_mode != "frozen"                  # VLM이 학습에 참여하는가
     reasoning_types = parse_reasoning_types(args.reasoning_types)   # [](baseline)~[spatial,decision,counterfactual]
+    keyframe_select = tuple(int(x) for x in str(args.keyframe_select).split(",") if x.strip() != "") \
+        or (0, 1, 2)                                               # keyframe 채점 대상 순서(기본 (1,)=정중앙)
 
     # 시간 맥락(temporal): vlm.TEMPORAL 스위치가 켜졌고 + 데이터에 history_images가 실제로 박혀 있을 때만
     #   과거 1 timestep(8뷰)을 condition에 넣는다(빌드 때 offset이 이미지에 안 닿으면 데이터에 없을 수 있음).
@@ -891,9 +1281,18 @@ def main() -> None:
         log(f"reasoning-only: OFF — 전 궤적 프레임 {len(ds)}개 사용(reasoning-free 포함)")
     log(f"cross-attn: {'ON (논문 #9, VLM 시퀀스 cross-attention)' if args.cross_attn else 'OFF (구형 pooled cond → AdaLN)'}")
     if args.maneuver_lateral_thr is not None and args.maneuver_lateral_thr >= 0:
-        log(f"selective-view: ON (thr={args.maneuver_lateral_thr}m) — 항상 전면3뷰, |ml|>thr이면 방향3뷰 추가(직진=3뷰)")
+        log(f"maneuver-thr(구형): ON (thr={args.maneuver_lateral_thr}m) — 미래GT 게이팅(폐기 예정)")
+    # temporal-clip(신규 폐루프) 상태 + 3설정 판별
+    if args.temporal_clip:
+        if args.selective_view and args.gate_weight <= 0:
+            log("⚠️ --selective-view True인데 --gate-weight 0 → 게이트가 없어 방향 예측 불가. gate-weight>0 필요(전 8뷰로 폴백).")
+        mode = ("selective+decision (폐루프 뷰 게이팅 + gate focal)" if args.selective_view and args.gate_weight > 0
+                else "8view+decision (전 8뷰, gate focal만)" if args.gate_weight > 0
+                else "8view baseline (전 8뷰, gate 없음)")
+        log(f"temporal-clip: ON | 설정 = {mode} | selective_view={args.selective_view} gate_weight={args.gate_weight}")
+        log("  clip 단위 시간순 롤아웃 — dir(t-1) 게이트 예측 → 프레임 t 뷰 게이팅(폐루프). DDP=clip 샤딩+sync_grads.")
     else:
-        log("selective-view: OFF — 전 8뷰 사용(baseline)")
+        log("temporal-clip: OFF — 프레임 독립 경로(DataLoader 셔플)")
 
     # 1) waypoints 정규화기 fit(전 rank 동일 데이터 → 동일 통계, 별도 동기화 불필요)
     normalizer = TrajectoryNormalizer.fit(ds.waypoints())
@@ -974,6 +1373,10 @@ def main() -> None:
         log(f"gate head: ON | class dist(0=straight,1=left,2=right)={dict(gate_counts)} | "
             f"alpha(class weight)={[round(a,3) for a in gate_alpha.tolist()]} | "
             f"focal_gamma={args.gate_focal_gamma} | weight(μ)={args.gate_weight}")
+        _train_gate = ("gate_direction GT로 뷰 게이팅(teacher-forcing)" if args.forcing == "teacher"
+                       else "이전 프레임 게이트 예측 dir(t-1)로 뷰 게이팅(student-forcing 폐루프)")
+        log(f"gate 뷰 게이팅: 학습={_train_gate} / 추론=게이트 예측으로 뷰 게이팅(closed-loop, GT 미사용) "
+            "→ --maneuver-lateral-thr 무시  (forcing/게이팅은 --temporal-clip --selective-view에서만 유효)")
     else:
         log("gate head: OFF (--gate-weight 0)")
 
@@ -1013,6 +1416,13 @@ def main() -> None:
     #    (매 epoch 셔플되므로 장기적으로 전 샘플이 고루 쓰임).
     my_steps = (len(my_indices) + args.batch_size - 1) // args.batch_size
     steps_per_epoch = ddp.all_reduce_min(my_steps)          # 전 rank 공통 step 수
+    # temporal-clip: clip 단위 시퀀스 롤아웃 → step = clip 1개(내부에서 프레임 순차 처리). clip을 rank별 샤딩.
+    my_clips = None
+    if args.temporal_clip:
+        all_clips = group_records_by_clip(ds.records)       # clip_token 정렬 → 전 rank 동일 순서(샤딩 재현)
+        my_clip_idx = ddp.shard(list(range(len(all_clips))))
+        my_clips = [all_clips[i] for i in my_clip_idx]
+        steps_per_epoch = ddp.all_reduce_min(len(my_clips)) # clip 1개 = 1 step
     total_steps = args.max_steps if args.max_steps > 0 else int(args.epochs * steps_per_epoch)
     n_reas = sum(1 for r in ds.records if reasoning_target(r, reasoning_types))  # 선택 종류로 LM_loss 걸릴 샘플 수
     # 그래디언트 누적: K micro-step마다 한 번 optimizer.step(). 유효 배치 = batch_size × K × world_size.
@@ -1067,10 +1477,16 @@ def main() -> None:
         f"  image_tokens = {img_tok}  (<= {IMAGE_MAX_PIXELS} px)",
         f"  temporal_on = {temporal_on}  (offset {TEMPORAL_HISTORY_OFFSET} frames)",
         f"  reasoning_types(parsed) = {reasoning_types if reasoning_types else 'none (baseline)'}",
+        f"  forcing = {args.forcing}  (뷰 게이팅 출처: student=폐루프예측 / teacher=GT; --temporal-clip --selective-view에서만 유효)",
         f"  train_samples = {len(ds)}",
         f"  reasoning_samples = {n_reas}/{len(ds)}",
         f"  val_samples = {len(val_records)}",
     ]
+    # forcing은 clip 시퀀스 + 뷰 게이팅이 켜진 경우에만 의미. 그 외 조합에선 무시됨을 명시(혼동 방지).
+    if not (args.temporal_clip and args.selective_view):
+        cfg_lines.append(f"  ⚠️ forcing={args.forcing} 무시됨 — --temporal-clip --selective-view 아님 "
+                         f"(temporal_clip={args.temporal_clip}, selective_view={args.selective_view}) → "
+                         f"{'순차 입력이되 항상 전 8뷰' if args.temporal_clip else '프레임 독립(구형) 경로'}.")
     logger.info("\n".join(cfg_lines) + "\n")
 
     dit.train()
@@ -1088,33 +1504,42 @@ def main() -> None:
     pad_id = processor.tokenizer.pad_token_id
     if pad_id is None:
         pad_id = processor.tokenizer.eos_token_id or 0
-    train_set = TrajTrainSet([ds.records[i] for i in my_indices], processor, prompt_tpl,
-                             temporal_on, reasoning_types, joint, ego_dim,
-                             maneuver_thr=args.maneuver_lateral_thr)
-    loader_kwargs = dict(batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
-                         collate_fn=partial(collate_traj, pad_id=pad_id),
-                         pin_memory=torch.cuda.is_available(), drop_last=False,
-                         generator=torch.Generator().manual_seed(SEED))
-    if args.num_workers > 0:                                # 워커 있을 때만 유효한 옵션
-        loader_kwargs.update(persistent_workers=True, prefetch_factor=args.prefetch_factor)
-    loader = DataLoader(train_set, **loader_kwargs)
+    # temporal-clip 경로는 DataLoader/DDP-wrapper를 쓰지 않는다(clip 내 순차 롤아웃 + prev_dir stateful이라
+    #   워커 오프로드·표준 DDP forward-once 가정과 맞지 않음). 대신 clip을 직접 순회하고 backward 후 sync_grads로
+    #   grad를 수동 all-reduce한다. 프레임 독립 경로(기존)는 DataLoader+prefetch+표준 DDP 그대로.
+    loader = ddp_model = None
+    sync_params = None
+    if not args.temporal_clip:
+        train_set = TrajTrainSet([ds.records[i] for i in my_indices], processor, prompt_tpl,
+                                 temporal_on, reasoning_types, joint, ego_dim,
+                                 maneuver_thr=args.maneuver_lateral_thr,
+                                 gate_teacher_forcing=(args.gate_weight > 0))
+        loader_kwargs = dict(batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
+                             collate_fn=partial(collate_traj, pad_id=pad_id),
+                             pin_memory=torch.cuda.is_available(), drop_last=False,
+                             generator=torch.Generator().manual_seed(SEED))
+        if args.num_workers > 0:                                # 워커 있을 때만 유효한 옵션
+            loader_kwargs.update(persistent_workers=True, prefetch_factor=args.prefetch_factor)
+        loader = DataLoader(train_set, **loader_kwargs)
 
-    # VLM+DiT를 한 nn.Module로 래핑. 학습 루프의 forward를 model(batch) 단일 진입점으로 통일.
-    #   self.dit/self.vlm는 위 dit_mod/vlm_mod와 동일 객체 → 저장·평가·probe·optimizer 경로 무변경.
-    model = TrajReasVLA(vlm_mod, dit_mod, normalizer, args.reas_weight, train_vlm, device,
-                       gate=gate_mod, gate_weight=args.gate_weight, gate_alpha=gate_alpha,
-                       gate_focal_gamma=args.gate_focal_gamma)
-    # 표준 DDP 전환: 수동 sync_grads 대신 torch DDP가 backward에서 grad를 자동 all-reduce(훅 기반).
-    #   - 0-더미로 lm_head가 매 step 사용됨이 보장 → find_unused_parameters=False로 데드락 없음(그래프 구조가
-    #     reasoning 유무로 바뀌어도, 모든 param이 grad를 받으므로 안전; static_graph는 그 가정이 위험해 미사용).
-    #   - broadcast_buffers=False: 버퍼(DiT 정규화 통계·4bit quant state 등)는 전 rank 동일 → 매 forward 동기화 불필요.
-    #   - GC 호환은 load_vlm의 use_reentrant=False가 담당. grad_accum은 아래 no_sync로 경계에서만 reduce.
-    if ddp.is_dist():
-        from torch.nn.parallel import DistributedDataParallel as DDP
-        ddp_model = DDP(model, device_ids=[lr_idx], output_device=lr_idx,
-                        find_unused_parameters=False, broadcast_buffers=False)
+        # VLM+DiT를 한 nn.Module로 래핑. 학습 루프의 forward를 model(batch) 단일 진입점으로 통일.
+        model = TrajReasVLA(vlm_mod, dit_mod, normalizer, args.reas_weight, train_vlm, device,
+                           gate=gate_mod, gate_weight=args.gate_weight, gate_alpha=gate_alpha,
+                           gate_focal_gamma=args.gate_focal_gamma)
+        # 표준 DDP: backward에서 grad 자동 all-reduce. 0-더미로 lm_head/gate가 매 step 그래프에 연결 →
+        #   find_unused_parameters=False로 데드락 없음. broadcast_buffers=False(버퍼는 전 rank 동일).
+        if ddp.is_dist():
+            from torch.nn.parallel import DistributedDataParallel as DDP
+            ddp_model = DDP(model, device_ids=[lr_idx], output_device=lr_idx,
+                            find_unused_parameters=False, broadcast_buffers=False)
+        else:
+            ddp_model = model                                    # 단일 GPU: 래퍼 그대로
     else:
-        ddp_model = model                                    # 단일 GPU: 래퍼 그대로(no_sync/all-reduce 불필요)
+        # clip 경로: 수동 grad 동기화 대상 파라미터(전 rank 동일 순서). ddp.sync_grads가 None-grad는 0으로 채워
+        #   collective에 참여시키므로 프레임별 그래프가 달라도 안전.
+        sync_params = list(dit_mod.parameters()) + (list(gate_mod.parameters()) if gate_mod is not None else []) + vlm_params
+        if gate_mod is not None:
+            gate_mod.train()
 
     step = 0
     done = False
@@ -1136,29 +1561,60 @@ def main() -> None:
         # DataLoader가 shard를 shuffle+prefetch로 흘려준다(워커가 다음 배치 load+preprocess를 미리 수행).
         # 전 rank 공통 steps_per_epoch 만큼만 소비(drop_last=False라 배치 수 ≥ steps_per_epoch → 남는 배치는
         # 이 epoch 스킵). 셔플은 loader의 generator(SEED)가 epoch마다 재현가능하게 재추출한다.
-        for s, batch in enumerate(loader):
+        # ── 두 학습 경로 분기: temporal-clip(clip 시퀀스 롤아웃) vs 프레임 독립(DataLoader) ──
+        if args.temporal_clip:
+            # clip 1개 = 1 step. clip_rollout_forward가 프레임 순차 처리 + 프레임별 backward(grad 로컬 누적).
+            #   경계에서 ddp.sync_grads로 수동 all-reduce → clip/opt-step 수가 전 rank 동일이라 collective 일치.
+            # ⚠️ 매 epoch **clip 순서만** 셔플(클립 내 frame 순서는 유지 → 인과 보존). clip끼리는 독립이라
+            #   순서를 섞어도 폐루프에 문제없다. SEED+epoch 기반 재현가능 셔플(rank별 shard는 원래 다름).
+            import random as _random
+            order = list(range(len(my_clips)))
+            _random.Random(SEED + epoch).shuffle(order)     # epoch마다 다르되 재현가능
+            batch_iter = ((s, my_clips[order[s]]) for s in range(steps_per_epoch))
+        else:
+            batch_iter = enumerate(loader)
+        for s, item in batch_iter:
             if s >= steps_per_epoch:                         # rank별 step 수 차이 → 데드락 방지(공통 최소만 소비)
                 break
-            # 누적 경계: K step마다 / epoch 마지막 step / total_steps 도달. no_sync 판단 위해 forward 前에 계산.
-            #   steps_per_epoch·grad_accum·total_steps가 전 rank 동일 → 경계(=DDP reduce 시점)도 전 rank 일치.
             at_boundary = ((s + 1) % grad_accum == 0) or (s == steps_per_epoch - 1) or ((step + 1) >= total_steps)
-            # 표준 DDP + grad accum: 비경계 step은 no_sync로 grad를 로컬 누적만(통신 skip), 경계 step의 backward에서
-            #   누적분을 한 번에 all-reduce(문서 권장 패턴). no_sync는 forward+backward를 함께 감싼다. 단일 GPU면 무통신.
-            use_no_sync = ddp.is_dist() and not at_boundary
-            with (ddp_model.no_sync() if use_no_sync else nullcontext()):
-                # 래핑 forward(메인 GPU): VLM forward+condition → DiT flow_loss(+λ·LM +μ·gate_CE +0-더미).
-                loss, flow, lm_loss, gate_ce = ddp_model(batch)   # (total, flow(detached), LM_loss, gate_CE or None)
-                (loss / grad_accum).backward()               # 1/K 스케일 → K번 누적하면 K-배치 평균 grad
+            if args.temporal_clip:
+                # clip 롤아웃: 프레임별 즉시 backward(grad_scale=1/grad_accum). loss는 로깅용 mean으로 재구성.
+                st = clip_rollout_forward(vlm_mod, dit_mod, gate_mod, normalizer, processor, prompt_tpl,
+                                          item, device, 1.0 / grad_accum, train_vlm=train_vlm, joint=joint,
+                                          reasoning_types=reasoning_types, ego_dim=ego_dim, temporal_on=temporal_on,
+                                          reas_weight=args.reas_weight, gate_weight=args.gate_weight,
+                                          gate_alpha=gate_alpha, gate_focal_gamma=args.gate_focal_gamma,
+                                          selective_view=args.selective_view, forcing=args.forcing)
+                flow = st["flow_sum"] / max(st["n"], 1)
+                lm_loss = (st["lm_sum"] / st["lm_n"]) if st["lm_n"] > 0 else None
+                gate_ce = (st["gate_sum"] / st["gate_n"]) if st["gate_n"] > 0 else None
+                loss = flow + (args.reas_weight * lm_loss if lm_loss is not None else 0.0) \
+                            + (args.gate_weight * gate_ce if gate_ce is not None else 0.0)
+                if at_boundary:                              # clip 경계: 수동 grad all-reduce 후 step
+                    ddp.sync_grads(sync_params)
+                    torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
+                    opt.step()
+                    if scheduler is not None:
+                        scheduler.step()
+                    opt.zero_grad(set_to_none=True)
+            else:
+                batch = item
+                # 표준 DDP + grad accum: 비경계 step은 no_sync로 grad 로컬 누적, 경계 backward에서 all-reduce.
+                use_no_sync = ddp.is_dist() and not at_boundary
+                with (ddp_model.no_sync() if use_no_sync else nullcontext()):
+                    loss, flow, lm_loss, gate_ce = ddp_model(batch)   # (total, flow(detached), LM_loss, gate_CE)
+                    (loss / grad_accum).backward()           # 1/K 스케일 → K번 누적하면 K-배치 평균 grad
+                loss = float(loss)
+                if at_boundary:                              # 경계: DDP가 grad를 rank 간 평균 완료 → clip + step
+                    torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
+                    opt.step()
+                    if scheduler is not None:                # 논문식 warmup+cosine: optimizer step 단위로 1회
+                        scheduler.step()
+                    opt.zero_grad(set_to_none=True)
             has_lm = 1.0 if lm_loss is not None else 0.0
             has_gate = 1.0 if gate_ce is not None else 0.0
             step += 1
             step_in_ep += 1
-            if at_boundary:                                  # 경계: DDP가 이미 grad를 rank 간 평균 완료 → clip + step
-                torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
-                opt.step()
-                if scheduler is not None:                    # 논문식 warmup+cosine: optimizer step 단위로 1회 진행
-                    scheduler.step()
-                opt.zero_grad(set_to_none=True)              # 다음 누적 그룹을 위해 초기화
             # 로깅 집계: 모든 rank가 동일하게 호출(조건부 호출 금지 — collective 불일치 hang 방지).
             g_flow = ddp.all_reduce_mean(float(flow))
             g_lm_sum = ddp.all_reduce_mean(float(lm_loss) if lm_loss is not None else 0.0)
@@ -1186,7 +1642,10 @@ def main() -> None:
                           normalizer, args.reas_weight, device, joint, temporal_on, reasoning_types,
                           maneuver_thr=args.maneuver_lateral_thr,
                           gate_mod=gate_mod, gate_weight=args.gate_weight, gate_alpha=gate_alpha,
-                          gate_focal_gamma=args.gate_focal_gamma)
+                          gate_focal_gamma=args.gate_focal_gamma,
+                          temporal_clip=args.temporal_clip, selective_view=args.selective_view,
+                          forcing=args.forcing, keyframe_eval=args.keyframe_eval,
+                          keyframe_select=keyframe_select)
         # best 갱신: val_loss가 이전 최소보다 낮으면 이 epoch을 best로 기록하고 가중치를 CPU 스냅샷.
         #   전 rank가 동일 ev["val_loss"]를 보므로 best_epoch 판단은 일치(스냅샷만 rank0).
         is_best = ev is not None and ev["val_loss"] < best_val
@@ -1257,7 +1716,12 @@ def main() -> None:
             "beta_alpha": args.beta_alpha, "beta_beta": args.beta_beta,
             "ode_steps": args.ode_steps,                   # 추론 K(논문=5). final_eval/eval_trajectory가 이 값 사용.
             "cross_attn": args.cross_attn,                 # DiT가 VLM 시퀀스에 cross-attention 했는지(평가 재구성용).
-            "maneuver_lateral_thr": args.maneuver_lateral_thr,  # selective-view 게이팅 thr(<0=off). 평가도 동일 적용.
+            "maneuver_lateral_thr": args.maneuver_lateral_thr,  # (구형) 미래GT 게이팅 thr. 평가도 동일 적용.
+            "temporal_clip": args.temporal_clip,           # clip 시퀀스 폐루프 여부(평가도 clip 순차 폐루프).
+            "selective_view": args.selective_view,         # 게이트 예측으로 뷰 게이팅 여부(폐루프).
+            "forcing": args.forcing,                       # 학습 뷰 게이팅 출처(student=폐루프예측/teacher=GT). 추론은 항상 student.
+            "keyframe_eval": args.keyframe_eval,           # 검증/최종평가를 keyframe(decision, 0.2Hz)만 채점(논문 정렬).
+            "keyframe_select": list(keyframe_select),      # clip당 decision 3개 중 채점 순서(기본 [1]=정중앙).
             # 1단계 게이트(cond→직진/좌/우): μ(gate_weight)>0이면 GateHead 학습(gate_head.pt 저장됨).
             "gate_weight": args.gate_weight, "gate_hidden": args.gate_hidden,
             "gate_focal_gamma": args.gate_focal_gamma,
@@ -1294,7 +1758,8 @@ def main() -> None:
             try:
                 fm = run_final_eval(vlm_mod, dit_mod, processor, normalizer, cfg, prompt_tpl,
                                     device, logger.run_dir, args.val, args.final_eval_limit,
-                                    viz_n=args.final_eval_viz, per_page=args.final_eval_per_page)
+                                    viz_n=args.final_eval_viz, per_page=args.final_eval_per_page,
+                                    gate_mod=gate_mod)      # 게이트 있으면 폐루프 추론(예측→뷰게이팅→planning)
                 if fm:
                     # ADE/FDE(m, 거리지표)는 소수 셋째자리 그대로. NC/DA/EP/CF/HL/NPS(0~1 저장값)는
                     # 표시 시에만 ×100(논문 %표기와 동일 스케일) + 소수 둘째자리로 변환(저장값 자체는 불변).
@@ -1316,6 +1781,9 @@ def main() -> None:
                                     f"fastest={sp['fastest_ms']:.2f} slowest={sp['slowest_ms']:.2f} "
                                     f"median={sp['median_ms']:.2f} mean={sp['mean_ms']:.2f} "
                                     f"(thr={fm.get('maneuver_lateral_thr')})")
+                    if fm.get("gate_closedloop"):             # 폐루프 게이트: 예측→뷰게이팅→planning
+                        logger.info(f"final eval | gate closed-loop | pred_acc={fm.get('gate_pred_acc')} "
+                                    "(게이트 방향 예측 → 그 뷰로 planning)")
             except Exception as e:                            # eval 실패해도 학습 산출물은 보존
                 logger.info(f"final eval 실패(건너뜀): {type(e).__name__}: {e}")
     logger.close()
