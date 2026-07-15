@@ -1216,6 +1216,9 @@ def main() -> None:
                          "넣어 waypoint가 self-attention으로 참조. --no-ego-state-token이면 구형(ego→AdaLN) 방식.")
     ap.add_argument("--limit", type=int, default=0, help="subset train for a quick run (0=all)")
     ap.add_argument("--max-steps", type=int, default=-1, help="cap optimizer steps (smoke test); -1=use epochs")
+    ap.add_argument("--seed", type=int, default=SEED,
+                    help=f"랜덤 시드(torch.manual_seed + DataLoader 셔플 generator + epoch별 clip 셔플). "
+                         f"기본={SEED}(vlm.SEED). 재현성 확인·시드 스윕용으로 --seed로 override.")
     # 학습 종료 후 최종 평가(ADE/FDE + BEV 시각화)를 rank0이 자동 실행. 이미 메모리의 모델 재사용(재로딩 없음).
     ap.add_argument("--final-eval", dest="final_eval", action=argparse.BooleanOptionalAction,
                     default=True,
@@ -1239,7 +1242,8 @@ def main() -> None:
         if main_proc:
             print(*a)
 
-    torch.manual_seed(SEED)
+    seed = args.seed                                       # vlm.SEED 기본값을 --seed로 override 가능
+    torch.manual_seed(seed)
     ds = TrajDataset(Path(args.train), args.limit)
     if len(ds) == 0:
         raise SystemExit("no trajectory samples in train.jsonl — rebuild SFT data (build_sft.py) first.")
@@ -1517,7 +1521,7 @@ def main() -> None:
         loader_kwargs = dict(batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
                              collate_fn=partial(collate_traj, pad_id=pad_id),
                              pin_memory=torch.cuda.is_available(), drop_last=False,
-                             generator=torch.Generator().manual_seed(SEED))
+                             generator=torch.Generator().manual_seed(seed))
         if args.num_workers > 0:                                # 워커 있을 때만 유효한 옵션
             loader_kwargs.update(persistent_workers=True, prefetch_factor=args.prefetch_factor)
         loader = DataLoader(train_set, **loader_kwargs)
@@ -1569,7 +1573,7 @@ def main() -> None:
             #   순서를 섞어도 폐루프에 문제없다. SEED+epoch 기반 재현가능 셔플(rank별 shard는 원래 다름).
             import random as _random
             order = list(range(len(my_clips)))
-            _random.Random(SEED + epoch).shuffle(order)     # epoch마다 다르되 재현가능
+            _random.Random(seed + epoch).shuffle(order)     # epoch마다 다르되 재현가능
             batch_iter = ((s, my_clips[order[s]]) for s in range(steps_per_epoch))
         else:
             batch_iter = enumerate(loader)
@@ -1722,6 +1726,7 @@ def main() -> None:
             "forcing": args.forcing,                       # 학습 뷰 게이팅 출처(student=폐루프예측/teacher=GT). 추론은 항상 student.
             "keyframe_eval": args.keyframe_eval,           # 검증/최종평가를 keyframe(decision, 0.2Hz)만 채점(논문 정렬).
             "keyframe_select": list(keyframe_select),      # clip당 decision 3개 중 채점 순서(기본 [1]=정중앙).
+            "seed": seed,                                  # 랜덤 시드(--seed override, 기본 vlm.SEED).
             # 1단계 게이트(cond→직진/좌/우): μ(gate_weight)>0이면 GateHead 학습(gate_head.pt 저장됨).
             "gate_weight": args.gate_weight, "gate_hidden": args.gate_hidden,
             "gate_focal_gamma": args.gate_focal_gamma,

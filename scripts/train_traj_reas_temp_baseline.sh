@@ -4,7 +4,7 @@
 # GPU0 결함 → 기본 0,1,2,3 사용(DECISIONS.md). 결과는 models/trajectory/에 저장.
 #
 # 사용:
-# GPUS=0,1,2,3,4,5,6,7 scripts/train_traj_reas.sh --vlm-mode lora --epochs 10 --batch-size 1 --grad-accum 1 --maneuver-lateral-thr -1.0 --reasoning-types decision,counterfactual --gate-weight 1.0 --selective-view --temporal-clip
+# GPUS=0,1,2,3,4,5,6,7 scripts/train_traj_reas.sh --vlm-mode lora --epochs 10 --batch-size 1 --grad-accum 1 --maneuver-lateral-thr -1.0 --reasoning-types decision,counterfactual --gate-weight 1.0 --selective-view --temporal-clip --keyframe-eval
 #
 # 뷰 게이팅 학습 방식(--temporal-clip --selective-view에서만 유효):
 #   --forcing student (기본): 프레임 t 뷰를 게이트의 t-1 예측으로 게이팅(폐루프, 추론과 동일 분포)
@@ -24,6 +24,12 @@ torchrun --standalone --nproc_per_node="$NPROC" \
   --epochs "${EPOCHS:-10}" \
   --batch-size "${BATCH_SIZE:-1}" \
   --grad-accum "${GRAD_ACCUM:-1}" \
+  --reasoning-types decision,counterfactual \
+  --gate-weight 0.0 \
+  --no-selective-view \
+  --temporal-clip \
+  --keyframe-eval \
+  --keyframe-select "0,1,2" \
   "$@"
 
 # 단일 학습
