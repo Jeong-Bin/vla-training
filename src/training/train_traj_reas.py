@@ -181,35 +181,14 @@ def history_for(rec: dict, temporal_on: bool):
     return rec.get("history_images") if temporal_on else None
 
 
-# ─── selective-view 게이팅(maneuver_lateral 기반 뷰 on/off) ───────────────────────────────
-# 대부분 직진이라 8뷰 전부는 비효율 → 기동(궤적 유도 maneuver_lateral)에 따라 뷰 부분집합만 VLM에 투입.
+# ─── selective-view 뷰 부분집합 상수 ────────────────────────────────────────────────────────
+# 방향(0=straight/1=left/2=right)에 따라 VLM에 투입할 카메라 뷰 부분집합. gate_views_by_direction이 사용.
 #   항상: 전면 3뷰(front_left=CAM_M_L0, front=CAM_M_F, front_right=CAM_M_R0)
-#   ml > +thr (좌회전/좌차선변경): 좌측 3뷰 추가(left=CAM_M_L1, back_left=CAM_M_L2, back=CAM_M_B)
-#   ml < −thr (우회전/우차선변경): 우측 3뷰 추가(right=CAM_M_R1, back_right=CAM_M_R2, back=CAM_M_B)
-#   |ml| ≤ thr (직진): 전면 3뷰만
-# thr<0/None이면 게이팅 off = 전 8뷰(baseline). ml None(구형 데이터)이면 안전하게 전뷰 유지.
+#   left : 좌측 3뷰 추가(left=CAM_M_L1, back_left=CAM_M_L2, back=CAM_M_B)
+#   right: 우측 3뷰 추가(right=CAM_M_R1, back_right=CAM_M_R2, back=CAM_M_B)
 GATE_ALWAYS = ("front_left", "front", "front_right")     # CAM_M_L0 / CAM_M_F / CAM_M_R0
 GATE_LEFT = ("left", "back_left", "back")                # CAM_M_L1 / CAM_M_L2 / CAM_M_B
 GATE_RIGHT = ("right", "back_right", "back")             # CAM_M_R1 / CAM_M_R2 / CAM_M_B
-
-
-def gate_views(image_recs, maneuver_lateral, thr):
-    """maneuver_lateral·thr로 뷰 부분집합 선택. image_recs=None이면 None(과거뷰 없음 그대로)."""
-    if image_recs is None:
-        return None
-    if thr is None or thr < 0 or maneuver_lateral is None:
-        return image_recs                                # 게이팅 off 또는 신호 없음 → 전뷰
-    keep = set(GATE_ALWAYS)
-    if maneuver_lateral > thr:
-        keep |= set(GATE_LEFT)
-    elif maneuver_lateral < -thr:
-        keep |= set(GATE_RIGHT)
-    return [im for im in image_recs if im.get("view") in keep]
-
-
-def rec_maneuver(rec: dict):
-    """레코드의 maneuver_lateral(궤적 유도 기동 신호). 없으면 None."""
-    return (rec.get("output") or {}).get("maneuver_lateral")
 
 
 # ─── selective-view 게이팅(gate_direction 기반 뷰 on/off, 폐루프용) ────────────────────────────
@@ -288,15 +267,38 @@ def parse_reasoning_types(s: str) -> list:
     return [t for t in REASONING_ORDER if t in want]
 
 
-def reasoning_target(rec: dict, types: list) -> "str | None":
+# _spatial_text_from_objs: 뷰 태그 객체 리스트를 build_sft._spatial_reasoning_text와 **동일 포맷**으로 직렬화.
+#   allowed_views 주면 관측 뷰가 그 집합과 겹치는 객체만(=입력된 뷰에 잡힌 객체만) 남겨 top-N. selective-view의
+#   "입력 이미지에 한해 spatial 서술" 구현. 비면(가시 객체 0) None → spatial 세그먼트 생략.
+def _spatial_text_from_objs(objs: list, allowed_views=None, max_n: int = 8) -> "str | None":
+    if allowed_views is not None:
+        av = set(allowed_views)
+        objs = [o for o in objs if set(o.get("views", ())) & av]   # 관측 뷰 ∩ 허용 뷰 ≠ ∅
+    objs = objs[:max_n]                                             # 이미 거리순 정렬 → top-N
+    if not objs:
+        return None
+    parts = [f"{o['category']} at {o['fwd_m']}m ahead {o['left_m']}m left ({o['dist_m']}m)" for o in objs]
+    return "Nearby objects: " + "; ".join(parts) + "."
+
+
+def reasoning_target(rec: dict, types: list, allowed_views=None) -> "str | None":
     """선택된 reasoning 종류를 표준 순서로 합쳐 하나의 LM 텍스트 타깃 생성(없으면 None).
-    신형 데이터(output.reasoning_parts) 우선, 구형(output.reasoning=decision)은 하위호환 폴백."""
+    신형 데이터(output.reasoning_parts) 우선, 구형(output.reasoning=decision)은 하위호환 폴백.
+    allowed_views(입력된 뷰 집합) 주면 spatial GT를 그 뷰에 관측된 객체만으로 재구성(selective-view 일관)."""
     if not types:
         return None
     out = rec.get("output", {})
     parts = out.get("reasoning_parts")
     if parts:
-        segs = [f"{t.capitalize()}: {parts[t]}" for t in types if parts.get(t)]
+        segs = []
+        for t in types:
+            # spatial + allowed_views + 구조화 객체 존재 → 뷰 필터해 재구성. 없으면(구형 데이터) 평문으로 폴백.
+            if t == "spatial" and allowed_views is not None and out.get("spatial_objects") is not None:
+                sp = _spatial_text_from_objs(out["spatial_objects"], allowed_views)
+                if sp:
+                    segs.append(f"Spatial: {sp}")
+            elif parts.get(t):
+                segs.append(f"{t.capitalize()}: {parts[t]}")
     elif "decision" in types and out.get("reasoning"):        # 구형 데이터 폴백(decision만 존재)
         segs = [f"Decision: {out['reasoning']}"]
     else:
@@ -488,7 +490,7 @@ class TrajTrainSet:
     dict를 돌려주는 map-style 데이터셋(DataLoader 워커에서 실행). torch.utils.data.Dataset을 상속하지
     않아도 __len__/__getitem__만 있으면 DataLoader가 받는다."""
     def __init__(self, records, processor, prompt_tpl, temporal_on, reasoning_types, joint, ego_dim,
-                 maneuver_thr=-1.0, gate_teacher_forcing=False):
+                 gate_teacher_forcing=False):
         self.records = records
         self.processor = processor
         self.prompt_tpl = prompt_tpl
@@ -496,10 +498,8 @@ class TrajTrainSet:
         self.reasoning_types = reasoning_types
         self.joint = joint
         self.ego_dim = ego_dim
-        self.maneuver_thr = maneuver_thr                   # selective-view 게이팅 임계값(<0=off, 전 8뷰)
-        # gate_teacher_forcing=True(--gate-weight>0): maneuver_thr(미래 GT) 대신 gate_direction GT(과거 결정
-        #   이월값)로 뷰 게이팅. 방법 A — "완벽한 과거 게이트 예측"으로 뷰 결정(teacher-forcing). 추론 땐 게이트
-        #   실제 예측을 씀(진짜 폐루프). 이 플래그가 True면 maneuver_thr 게이팅은 무시된다.
+        # gate_teacher_forcing=True(--gate-weight>0): gate_direction GT(과거 결정 이월값)로 뷰 게이팅
+        #   (teacher-forcing). 추론 땐 게이트 실제 예측을 씀(진짜 폐루프). False면 전 8뷰(게이팅 없음).
         self.gate_teacher_forcing = gate_teacher_forcing
 
     def __len__(self):
@@ -508,15 +508,16 @@ class TrajTrainSet:
     def __getitem__(self, i):
         rec = self.records[i]
         prompt = self.prompt_tpl.replace("{mission}", rec.get("mission") or "drive safely")
-        reasoning = reasoning_target(rec, self.reasoning_types) if self.joint else None  # 선택 종류 합친 LM 타깃
         if self.gate_teacher_forcing:                       # 폐루프 학습: gate_direction GT로 뷰 게이팅
             gdir = rec_gate_direction(rec)                  # 0/1/2/None(첫 구간→전뷰)
             imgs = gate_views_by_direction(rec["images"], gdir)
             hist = gate_views_by_direction(history_for(rec, self.temporal_on), gdir)
-        else:                                               # 구형: maneuver_lateral(미래 GT)+thr 게이팅
-            ml = rec_maneuver(rec)                          # 기동 신호(궤적 유도)
-            imgs = gate_views(rec["images"], ml, self.maneuver_thr)              # 현재뷰 게이팅
-            hist = gate_views(history_for(rec, self.temporal_on), ml, self.maneuver_thr)  # 과거뷰도 동일 게이팅
+        else:                                               # 게이팅 없음 → 전 8뷰
+            imgs = rec["images"]
+            hist = history_for(rec, self.temporal_on)
+        # spatial GT 필터: 게이팅 시 입력된 뷰에 관측된 객체만으로 spatial 재구성(입력=GT 일관)
+        allowed_views = {im["view"] for im in imgs} if self.gate_teacher_forcing else None
+        reasoning = reasoning_target(rec, self.reasoning_types, allowed_views) if self.joint else None
         enc, labels, plen = build_model_inputs(self.processor, imgs, prompt, reasoning, hist)
         ego = torch.tensor(ego_vec(rec, self.ego_dim), dtype=torch.float32) if self.ego_dim > 0 else None
         return {
@@ -684,22 +685,25 @@ def clip_rollout_forward(vlm, dit, gate, normalizer, processor, prompt_tpl, clip
     if gate_alpha is not None:
         gate_alpha = gate_alpha.to(device)     # 원본은 CPU(rank 공유) → 이 rank GPU로(focal_loss device 일치)
     prev_dir = None                                        # 첫 프레임: 과거 게이트 예측 없음 → 전 8뷰
+    prev_gt_dir = None                                     # 직전 프레임의 gate_direction GT(teacher 게이팅용)
     n = 0
     flow_sum = lm_sum = gate_sum = 0.0
     lm_n = gate_n = 0
     ctx = nullcontext() if train_vlm else torch.no_grad()
     for rec in clip_recs:
         prompt = prompt_tpl.replace("{mission}", rec.get("mission") or "drive safely")
-        reasoning = reasoning_target(rec, reasoning_types) if joint else None
-        # 뷰 게이팅 방향: student=prev_dir(t-1 예측), teacher=현재 프레임 GT gate_direction. 아니면 전 8뷰.
-        #   history도 동일 방향으로 게이팅. teacher는 GT가 None(예: 0~49)이면 gate_views_by_direction이 전 8뷰.
+        # 뷰 게이팅 방향(둘 다 **직전 프레임 t-1**의 방향): student=prev_dir(t-1 예측), teacher=prev_gt_dir
+        #   (t-1 GT). 시점이 일치해 두 forcing 비교가 깨끗하다. 첫 프레임은 None → 전 8뷰(안전).
         if selective_view:
-            gate_dir = rec_gate_direction(rec) if forcing == "teacher" else prev_dir
+            gate_dir = prev_gt_dir if forcing == "teacher" else prev_dir
             imgs = gate_views_by_direction(rec["images"], gate_dir)      # None→8뷰
             hist = gate_views_by_direction(history_for(rec, temporal_on), gate_dir)
         else:
             imgs = rec["images"]
             hist = history_for(rec, temporal_on)
+        # spatial GT 필터: selective_view면 **실제 입력된 뷰**에 관측된 객체만으로 spatial 재구성(입력=GT 일관).
+        allowed_views = {im["view"] for im in imgs} if selective_view else None
+        reasoning = reasoning_target(rec, reasoning_types, allowed_views) if joint else None
         with ctx:
             cvec, lm_loss, hs, cmask = encode_and_lm_loss(vlm, processor, imgs, prompt, reasoning, hist)
         cond = cvec.unsqueeze(0).to(device)                # (1, hidden)
@@ -714,7 +718,7 @@ def clip_rollout_forward(vlm, dit, gate, normalizer, processor, prompt_tpl, clip
         # 게이트: 현재 프레임 gate_direction GT로 focal 지도 + 다음 프레임 뷰용 dir 예측
         if gate is not None:
             logits = gate(cond)                            # (1,3)
-            gd = rec_gate_direction(rec)
+            gd = rec_gate_direction(rec)                   # 현재 프레임 GT(게이트 손실 타깃 — 게이팅 소스 아님)
             if gate_weight > 0 and gd is not None:
                 gce = focal_loss(logits, torch.tensor([gd], dtype=torch.long, device=device),
                                  alpha=gate_alpha, gamma=gate_focal_gamma)
@@ -722,7 +726,8 @@ def clip_rollout_forward(vlm, dit, gate, normalizer, processor, prompt_tpl, clip
                 gate_sum += float(gce); gate_n += 1
             else:                                          # gate 라벨 없는 프레임: 0-더미로 head 그래프 유지
                 frame_loss = frame_loss + 0.0 * logits.float().mean()
-            prev_dir = int(logits.argmax(-1).item())       # 다음 프레임 뷰 게이팅용(폐루프, item()=detach)
+            prev_dir = int(logits.argmax(-1).item())       # 다음 프레임 student 게이팅용(폐루프, item()=detach)
+        prev_gt_dir = rec_gate_direction(rec)              # 다음 프레임 teacher 게이팅용(현재 프레임 GT → 다음의 t-1 GT)
         (frame_loss * grad_scale).backward()               # 프레임별 즉시 backward → 그래프 해제(메모리 안전)
     stats = {"n": n, "flow_sum": flow_sum, "lm_sum": lm_sum, "lm_n": lm_n,
              "gate_sum": gate_sum, "gate_n": gate_n}
@@ -735,7 +740,7 @@ def clip_rollout_forward(vlm, dit, gate, normalizer, processor, prompt_tpl, clip
 #   동일 평균을 복원한다(rank0 단독 직렬보다 ~world_size배 빠르고, 모든 rank가 동일 collective를 호출해
 #   데드락 없음). 반환: {"val_loss","val_flow","val_lm"} (전 rank reasoning 샘플 0이면 val_lm 생략).
 def evaluate(vlm, dit_mod, processor, val_records, prompt_tpl, normalizer, reas_weight, device, joint,
-             temporal_on=False, reasoning_types=(), maneuver_thr=-1.0,
+             temporal_on=False, reasoning_types=(),
              gate_mod=None, gate_weight=0.0, gate_alpha=None, gate_focal_gamma=2.0,
              temporal_clip=False, selective_view=False, forcing="student", keyframe_eval=False,
              keyframe_select=(0, 1, 2)):
@@ -806,18 +811,22 @@ def evaluate(vlm, dit_mod, processor, val_records, prompt_tpl, normalizer, reas_
             my_clip_idx = ddp.shard(list(range(len(clips))))
             for ci in my_clip_idx:
                 prev_dir = None
+                prev_gt_dir = None                         # 직전 프레임 gate_direction GT(teacher 게이팅용)
                 for rec in clips[ci]:
                     # keyframe_eval: 전 프레임을 롤아웃(prev_dir 폐루프 유지)하되 **선택된 keyframe만 채점**(논문 정렬).
                     kf = (not keyframe_eval) or (rec["id"] in kf_ids)
                     prompt = prompt_tpl.replace("{mission}", rec.get("mission") or "drive safely")
-                    reasoning = reasoning_target(rec, reasoning_types) if joint else None
-                    # val_loss는 학습과 동일 게이팅: student=prev_dir(폐루프), teacher=현재 GT.
-                    if selective_view and gate_mod is not None:
-                        gate_dir = rec_gate_direction(rec) if forcing == "teacher" else prev_dir
+                    # val_loss는 학습과 동일 게이팅(둘 다 t-1): student=prev_dir(예측), teacher=prev_gt_dir(GT).
+                    sel = selective_view and gate_mod is not None
+                    if sel:
+                        gate_dir = prev_gt_dir if forcing == "teacher" else prev_dir
                         imgs = gate_views_by_direction(rec["images"], gate_dir)
                         hist = gate_views_by_direction(history_for(rec, temporal_on), gate_dir)
                     else:
                         imgs = rec["images"]; hist = history_for(rec, temporal_on)
+                    # spatial GT 필터: 입력된 뷰에 관측된 객체만(학습과 동일 일관)
+                    allowed_views = {im["view"] for im in imgs} if sel else None
+                    reasoning = reasoning_target(rec, reasoning_types, allowed_views) if joint else None
                     c, lml, mem, mem_mask = encode_and_lm_loss(vlm, processor, imgs, prompt, reasoning, hist)
                     cond = c.unsqueeze(0).to(device)
                     if kf:                                 # 손실은 keyframe만 집계
@@ -834,7 +843,8 @@ def evaluate(vlm, dit_mod, processor, val_records, prompt_tpl, normalizer, reas_
                             cond_cl = cond
                         pd = _accum_gate_metrics(rec, cond_cl) if kf \
                             else int(gate_mod(cond_cl).argmax(-1).item())
-                        prev_dir = pd                      # 다음 프레임 closed-loop 게이팅용(매 프레임 갱신)
+                        prev_dir = pd                      # 다음 프레임 student 게이팅용(매 프레임 갱신)
+                    prev_gt_dir = rec_gate_direction(rec)  # 다음 프레임 teacher 게이팅용(현재 GT → 다음의 t-1 GT)
         else:
             # 프레임 독립 경로: keyframe_eval이면 선택된 keyframe만 남겨 샤딩(rank 부하 균형 + 채점 대상 일치).
             idxs = [i for i in range(len(val_records))
@@ -844,13 +854,12 @@ def evaluate(vlm, dit_mod, processor, val_records, prompt_tpl, normalizer, reas_
                 rec = val_records[i]
                 prompt = prompt_tpl.replace("{mission}", rec.get("mission") or "drive safely")
                 reasoning = reasoning_target(rec, reasoning_types) if joint else None
-                ml = rec_maneuver(rec)                       # 학습과 동일(구형) 게이팅으로 val_loss 측정
-                imgs = gate_views(rec["images"], ml, maneuver_thr)
+                imgs = rec["images"]                          # 프레임 독립 경로는 전 8뷰(게이팅 없음)
                 c, lml, mem, mem_mask = encode_and_lm_loss(vlm, processor, imgs, prompt, reasoning,
-                                                           gate_views(history_for(rec, temporal_on), ml, maneuver_thr))
+                                                           history_for(rec, temporal_on))
                 cond = c.unsqueeze(0).to(device)
                 _accum_loss(rec, cond, mem.to(device), mem_mask.to(device), lml)
-                _accum_gate_metrics(rec, cond)     # (구형 경로) GT-direction 게이팅이 아니라 leakage 없음
+                _accum_gate_metrics(rec, cond)     # 게이트 정확도(closed-loop cond) — leakage 없음
     if was_training:
         dit_mod.train()
     if gate_mod is not None and gate_was_training:
@@ -899,7 +908,6 @@ def run_final_eval(vlm_mod, dit_mod, processor, normalizer, cfg, prompt_tpl, dev
         return
     temporal_on = cfg.get("temporal", False)              # 학습이 과거뷰를 썼으면 평가도 동일하게(일관)
     ode_steps = cfg.get("ode_steps", 5)                   # 논문 K=5(flow-matching 소수스텝). cfg로 학습·평가 일관
-    man_thr = cfg.get("maneuver_lateral_thr", -1.0)       # selective-view 게이팅(학습과 동일 thr로 평가)
     dit_mod.eval()
     vlm_was_train = vlm_mod.training
     vlm_mod.eval()
@@ -1012,12 +1020,10 @@ def run_final_eval(vlm_mod, dit_mod, processor, normalizer, cfg, prompt_tpl, dev
                     if gate_mod is not None:                  # (구형 Pass 게이팅) 전방3뷰 예측→뷰게이팅
                         cond, mem, mem_mask, pred_dir, _uv = gate_closedloop_encode(
                             vlm_mod, gate_mod, processor, rec, prompt, temporal_on, device)
-                    else:                                     # (구형) maneuver_lateral(미래 GT)+thr 게이팅
+                    else:                                     # 게이팅 없음 → 전 8뷰
                         pred_dir = None
-                        _ml = rec_maneuver(rec)
-                        cvec, mem, mem_mask = encode_condition(vlm_mod, processor,
-                                                               gate_views(rec["images"], _ml, man_thr), prompt,
-                                                               gate_views(history_for(rec, temporal_on), _ml, man_thr))
+                        cvec, mem, mem_mask = encode_condition(vlm_mod, processor, rec["images"], prompt,
+                                                               history_for(rec, temporal_on))
                         cond = cvec.unsqueeze(0).to(device); mem = mem.to(device); mem_mask = mem_mask.to(device)
                     pred_norm = _infer(rec, cond, mem, mem_mask)
                     if torch.cuda.is_available():
@@ -1042,7 +1048,7 @@ def run_final_eval(vlm_mod, dit_mod, processor, normalizer, cfg, prompt_tpl, dev
                "ADE_mean": round(float(np.mean(ades)), 3), "FDE_mean": round(float(np.mean(fdes)), 3),
                "ADE_baseline_cv": round(float(np.mean(cv_ades)), 3),
                "FDE_baseline_cv": round(float(np.mean(cv_fdes)), 3), "ode_steps": ode_steps,
-               "maneuver_lateral_thr": man_thr, "inference_speed_ms": speed_stats,
+               "inference_speed_ms": speed_stats,
                **plan_agg}                                     # NC_mean..NPS_mean, n_nps
     if gate_mod is not None:                                  # 폐루프 게이트 예측 정확도(gate_direction GT 대비)
         metrics["gate_closedloop"] = True
@@ -1054,7 +1060,7 @@ def run_final_eval(vlm_mod, dit_mod, processor, normalizer, cfg, prompt_tpl, dev
     print(format_table(plan_agg, ade=metrics["ADE_mean"]))
     print(f"(NPS 유효 표본 {plan_agg.get('n_nps', 0)}/{n_scored}; 미니 근사 — planning_metrics.py 주석 참고)\n")
     print(f"=== inference speed (ms/sample, VLM encode + DiT sample, n={speed_stats['n_timed']}, "
-          f"1번째 워밍업 제외, selective-view thr={man_thr}) ===")
+          f"1번째 워밍업 제외) ===")
     if speed_stats["n_timed"]:
         print(f"  Fastest: {speed_stats['fastest_ms']:8.2f} ms")
         print(f"  Slowest: {speed_stats['slowest_ms']:8.2f} ms")
@@ -1075,10 +1081,8 @@ def run_final_eval(vlm_mod, dit_mod, processor, normalizer, cfg, prompt_tpl, dev
     with torch.no_grad():
         for rec in chosen:
             prompt = prompt_tpl.replace("{mission}", rec.get("mission") or "drive safely")
-            _ml = rec_maneuver(rec)
-            hist = gate_views(history_for(rec, temporal_on), _ml, man_thr)
-            cvec, mem, mem_mask = encode_condition(vlm_mod, processor,
-                                                   gate_views(rec["images"], _ml, man_thr), prompt, hist)
+            hist = history_for(rec, temporal_on)             # 시각화는 전 8뷰(게이팅 없음)
+            cvec, mem, mem_mask = encode_condition(vlm_mod, processor, rec["images"], prompt, hist)
             cond = cvec.unsqueeze(0).to(device); mem = mem.to(device); mem_mask = mem_mask.to(device)
             ego = torch.tensor([ego_vec(rec, dit_mod.ego_dim)], dtype=torch.float32, device=device) \
                 if dit_mod.ego_dim > 0 else None
@@ -1100,10 +1104,7 @@ def run_final_eval(vlm_mod, dit_mod, processor, normalizer, cfg, prompt_tpl, dev
                             "images": rec["images"], "mission": rec.get("mission"),
                             "gt_reasoning": rec["output"].get("reasoning"),
                             "pred_reasoning": gen,        # 8뷰 가운데 요약에 표시
-                            # selective-view: 실제 VLM에 입력된 뷰 이름 집합(None=게이팅 off, 전 8뷰 입력).
-                            #   plot_8view가 이걸로 "꺼진 뷰"를 시각적으로 구분(단순 missing과 다름).
-                            "gated_views": (sorted(im["view"] for im in gate_views(rec["images"], _ml, man_thr))
-                                           if man_thr is not None and man_thr >= 0 else None)})
+                            "gated_views": None})         # 시각화는 전 8뷰(게이팅 off)
     save_visuals(samples, out_dir, tag, per_page,             # {tag}_trajectories_{i}.png + {tag}_8view/{i}_images/
                  reasoning_types=cfg.get("reasoning_types", []))   # 3뷰 Pred 열: 학습한 reasoning 종류만
     if vlm_was_train:
@@ -1171,10 +1172,6 @@ def main() -> None:
                     help="(기본 켜짐, 논문 nuVLA #9) DiT가 VLM hidden **시퀀스 전체**에 cross-attention. "
                          "scene은 cross-attn으로 유입, AdaLN은 timestep만. --no-cross-attn이면 구형(pooled cond → AdaLN). "
                          "⚠️ 메모리: VLM 시퀀스(~수백 토큰)를 KV로 유지 — full 모드면 grad도 흐름.")
-    ap.add_argument("--maneuver-lateral-thr", dest="maneuver_lateral_thr", type=float, default=-1.0,
-                    help="selective-view 게이팅 임계값(m). <0=off(전 8뷰=baseline). >0이면 maneuver_lateral로 "
-                         "뷰 선택: 항상 전면3뷰(L0/F/R0), ml>+thr(좌)→L1/L2/B 추가, ml<−thr(우)→R1/R2/B 추가. "
-                         "실험: 0.5 / 0.75 / 1.0. 평가도 이 값을 cfg에서 읽어 동일 적용.")
     ap.add_argument("--gate-weight", dest="gate_weight", type=float, default=0.0,
                     help="selective-view 1단계 게이트(cond→직진/좌/우 3-class) 손실 가중 μ. total = flow + λ·LM + "
                          "μ·gate_CE. 0(기본)=게이트 헤드 비활성. >0이면 GateHead 학습 — 타깃은 build_sft가 심은 "
@@ -1197,10 +1194,10 @@ def main() -> None:
                          "/ selective+decision(--selective-view --gate-weight 1). ⚠️ --temporal-clip와 함께 사용.")
     ap.add_argument("--forcing", choices=["student", "teacher"], default="student",
                     help="학습 시 뷰 게이팅 방향의 출처(--temporal-clip --selective-view에서만 유효). "
-                         "student(기본, 폐루프): 프레임 t 뷰를 게이트의 t-1 예측으로 게이팅 — 추론과 동일 분포지만 "
-                         "게이트가 나쁘면 붕괴 자기강화. teacher: 프레임 t 뷰를 그 프레임 GT gate_direction으로 게이팅 "
-                         "— 프레임 독립·항상 올바른 뷰로 학습해 안정적. ⚠️ 추론은 GT가 없어 항상 student 폐루프. "
-                         "--no-selective-view면 forcing 무관하게 항상 전 8뷰(순차 입력만 유지).")
+                         "student(기본, 폐루프): 프레임 t 뷰를 게이트의 **t-1 예측**으로 게이팅 — 추론과 동일 분포지만 "
+                         "게이트가 나쁘면 붕괴 자기강화. teacher: 프레임 t 뷰를 **이전 프레임(t-1)의 gate_direction GT**로 "
+                         "게이팅 — student와 시점(t-1) 일치·항상 올바른 뷰로 학습해 안정적(exposure bias는 있음). "
+                         "⚠️ 추론은 GT가 없어 항상 student 폐루프. --no-selective-view면 forcing 무관하게 항상 전 8뷰.")
     ap.add_argument("--keyframe-eval", dest="keyframe_eval", action=argparse.BooleanOptionalAction,
                     default=False,
                     help="(논문 정렬) 검증/최종평가를 **keyframe에서만** 채점. temporal-clip 폐루프는 전 프레임을 "
@@ -1284,8 +1281,6 @@ def main() -> None:
     else:
         log(f"reasoning-only: OFF — 전 궤적 프레임 {len(ds)}개 사용(reasoning-free 포함)")
     log(f"cross-attn: {'ON (논문 #9, VLM 시퀀스 cross-attention)' if args.cross_attn else 'OFF (구형 pooled cond → AdaLN)'}")
-    if args.maneuver_lateral_thr is not None and args.maneuver_lateral_thr >= 0:
-        log(f"maneuver-thr(구형): ON (thr={args.maneuver_lateral_thr}m) — 미래GT 게이팅(폐기 예정)")
     # temporal-clip(신규 폐루프) 상태 + 3설정 판별
     if args.temporal_clip:
         if args.selective_view and args.gate_weight <= 0:
@@ -1377,10 +1372,10 @@ def main() -> None:
         log(f"gate head: ON | class dist(0=straight,1=left,2=right)={dict(gate_counts)} | "
             f"alpha(class weight)={[round(a,3) for a in gate_alpha.tolist()]} | "
             f"focal_gamma={args.gate_focal_gamma} | weight(μ)={args.gate_weight}")
-        _train_gate = ("gate_direction GT로 뷰 게이팅(teacher-forcing)" if args.forcing == "teacher"
+        _train_gate = ("이전 프레임 gate_direction GT(t-1)로 뷰 게이팅(teacher-forcing)" if args.forcing == "teacher"
                        else "이전 프레임 게이트 예측 dir(t-1)로 뷰 게이팅(student-forcing 폐루프)")
         log(f"gate 뷰 게이팅: 학습={_train_gate} / 추론=게이트 예측으로 뷰 게이팅(closed-loop, GT 미사용) "
-            "→ --maneuver-lateral-thr 무시  (forcing/게이팅은 --temporal-clip --selective-view에서만 유효)")
+            "(forcing/게이팅은 --temporal-clip --selective-view에서만 유효)")
     else:
         log("gate head: OFF (--gate-weight 0)")
 
@@ -1516,7 +1511,6 @@ def main() -> None:
     if not args.temporal_clip:
         train_set = TrajTrainSet([ds.records[i] for i in my_indices], processor, prompt_tpl,
                                  temporal_on, reasoning_types, joint, ego_dim,
-                                 maneuver_thr=args.maneuver_lateral_thr,
                                  gate_teacher_forcing=(args.gate_weight > 0))
         loader_kwargs = dict(batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
                              collate_fn=partial(collate_traj, pad_id=pad_id),
@@ -1644,7 +1638,6 @@ def main() -> None:
             # 모든 rank가 동일 collective를 호출하므로 별도 barrier 없이 동기화된다(데드락 없음).
             ev = evaluate(vlm_mod, dit_mod, processor, val_records, prompt_tpl,
                           normalizer, args.reas_weight, device, joint, temporal_on, reasoning_types,
-                          maneuver_thr=args.maneuver_lateral_thr,
                           gate_mod=gate_mod, gate_weight=args.gate_weight, gate_alpha=gate_alpha,
                           gate_focal_gamma=args.gate_focal_gamma,
                           temporal_clip=args.temporal_clip, selective_view=args.selective_view,
@@ -1720,7 +1713,6 @@ def main() -> None:
             "beta_alpha": args.beta_alpha, "beta_beta": args.beta_beta,
             "ode_steps": args.ode_steps,                   # 추론 K(논문=5). final_eval/eval_trajectory가 이 값 사용.
             "cross_attn": args.cross_attn,                 # DiT가 VLM 시퀀스에 cross-attention 했는지(평가 재구성용).
-            "maneuver_lateral_thr": args.maneuver_lateral_thr,  # (구형) 미래GT 게이팅 thr. 평가도 동일 적용.
             "temporal_clip": args.temporal_clip,           # clip 시퀀스 폐루프 여부(평가도 clip 순차 폐루프).
             "selective_view": args.selective_view,         # 게이트 예측으로 뷰 게이팅 여부(폐루프).
             "forcing": args.forcing,                       # 학습 뷰 게이팅 출처(student=폐루프예측/teacher=GT). 추론은 항상 student.
@@ -1784,8 +1776,7 @@ def main() -> None:
                     if sp.get("n_timed"):
                         logger.info(f"final eval | speed(ms) n={sp['n_timed']} "
                                     f"fastest={sp['fastest_ms']:.2f} slowest={sp['slowest_ms']:.2f} "
-                                    f"median={sp['median_ms']:.2f} mean={sp['mean_ms']:.2f} "
-                                    f"(thr={fm.get('maneuver_lateral_thr')})")
+                                    f"median={sp['median_ms']:.2f} mean={sp['mean_ms']:.2f}")
                     if fm.get("gate_closedloop"):             # 폐루프 게이트: 예측→뷰게이팅→planning
                         logger.info(f"final eval | gate closed-loop | pred_acc={fm.get('gate_pred_acc')} "
                                     "(게이트 방향 예측 → 그 뷰로 planning)")

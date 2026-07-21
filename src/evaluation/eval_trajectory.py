@@ -24,7 +24,7 @@ sys.path.insert(0, str(REPO / "src"))
 from nureasoning import SFT_VAL, load_processor, upsample_waypoints             # noqa: E402
 from training.dit_head import TrajectoryDiT, TrajectoryNormalizer, GateHead  # noqa: E402
 from training.train_traj_reas import (encode_condition, ego_vec, history_for, load_vlm,  # noqa: E402
-                                       has_reasoning_annotation, gate_views, rec_maneuver,
+                                       has_reasoning_annotation,
                                        gate_closedloop_encode, rec_gate_direction, gate_views_by_direction,
                                        clip_closedloop_iter, group_records_by_clip, is_keyframe,
                                        select_keyframe_ids)  # 학습=평가 동일 인코더/ego/필터/게이팅/폐루프/keyframe
@@ -121,8 +121,7 @@ def main() -> None:
     dit.load_state_dict(torch.load(adapter / "dit_head.pt", map_location="cuda:0"))
     dit.eval()
     temporal_on = cfg.get("temporal", False)              # 학습이 과거뷰를 썼으면 평가도 동일하게(일관)
-    man_thr = cfg.get("maneuver_lateral_thr", -1.0)       # selective-view 게이팅(학습과 동일 thr)
-    # 게이트 헤드(폐루프): gate_head.pt가 있으면 로드 → 게이트 예측으로 뷰 게이팅(closed-loop). man_thr 무시.
+    # 게이트 헤드(폐루프): gate_head.pt가 있으면 로드 → 게이트 예측으로 뷰 게이팅(closed-loop).
     gate_mod = None
     gate_path = adapter / "gate_head.pt"
     if cfg.get("gate_weight", 0) > 0 and gate_path.exists():
@@ -143,7 +142,7 @@ def main() -> None:
     elif gate_mod is not None:
         mode = "gate closed-loop(구형 Pass 게이팅)"
     else:
-        mode = ('thr=' + str(man_thr) + 'm' if man_thr is not None and man_thr >= 0 else 'OFF(8뷰)')
+        mode = "OFF(8뷰)"
     print(f"evaluating {len(recs)} trajectory samples (ODE steps={args.steps}, "
           f"temporal={'ON' if temporal_on else 'OFF'}, mode={mode})\n")
 
@@ -248,12 +247,10 @@ def main() -> None:
                     if gate_mod is not None:               # (구형 Pass 게이팅) 전방3뷰 예측→뷰게이팅
                         cond, mem, mem_mask, pred_dir, _uv = gate_closedloop_encode(
                             vlm, gate_mod, processor, rec, prompt, temporal_on, "cuda:0")
-                    else:                                  # (구형) maneuver_lateral(미래 GT)+thr 게이팅
+                    else:                                  # 게이팅 없음 → 전 8뷰
                         pred_dir = None
-                        _ml = rec_maneuver(rec)
-                        cvec, mem, mem_mask = encode_condition(vlm, processor,
-                                                               gate_views(rec["images"], _ml, man_thr), prompt,
-                                                               gate_views(history_for(rec, temporal_on), _ml, man_thr))
+                        cvec, mem, mem_mask = encode_condition(vlm, processor, rec["images"], prompt,
+                                                               history_for(rec, temporal_on))
                         cond = cvec.unsqueeze(0).to("cuda:0"); mem = mem.to("cuda:0"); mem_mask = mem_mask.to("cuda:0")
                     pred_norm = _infer(rec, cond, mem, mem_mask)
                     if torch.cuda.is_available():
@@ -294,7 +291,6 @@ def main() -> None:
         "ADE_baseline_cv": round(float(np.mean(cv_ades)), 3),
         "FDE_baseline_cv": round(float(np.mean(cv_fdes)), 3),
         "ode_steps": args.steps,
-        "maneuver_lateral_thr": man_thr,                   # 이 속도 통계가 어떤 게이팅 조건에서 나왔는지 기록
         "inference_speed_ms": speed_stats,                 # 샘플당 VLM encode+DiT sample wall-clock(ms), 워밍업 제외
         **plan_agg,
     }
@@ -318,7 +314,7 @@ def main() -> None:
     print(format_table(plan_agg, ade=metrics["ADE_mean"]))
     print(f"(NPS 유효 표본 {plan_agg.get('n_nps', 0)}/{n_scored}; 미니 근사 — planning_metrics.py 주석 참고)")
     print(f"\n=== inference speed (ms/sample, VLM encode + DiT sample, n={speed_stats['n_timed']}, "
-          f"1번째 워밍업 제외, selective-view thr={man_thr}) ===")
+          f"1번째 워밍업 제외) ===")
     if speed_stats["n_timed"]:
         print(f"  Fastest: {speed_stats['fastest_ms']:8.2f} ms")
         print(f"  Slowest: {speed_stats['slowest_ms']:8.2f} ms")

@@ -63,6 +63,7 @@ INSTRUCTION = ("Mission: {mission}. Given the scene, what longitudinal and later
 # spatial supervision 타깃에 담을 최대 객체 수(가까운 순). 8뷰 합 ~54개라 타깃이 길어지므로
 # 캡해 시퀀스 길이를 통제(논문 A의 1Hz spatial supervision을 미니 규모로 재현).
 SPATIAL_MAX_OBJECTS = 15
+SPATIAL_OBJECTS_STORE_MAX = 40   # 궤적 레코드에 저장할 뷰태그 객체 최대(뷰 필터 후 top-8 확보용 여유)
 
 # 궤적 planning 타깃 스펙(논문 nuVLA action expert 정렬): T=10 waypoints @ 2Hz, 5초 horizon, (x,y,θ) ego-frame.
 #   원본 trajectory_future는 (50,3)[x,y,yaw] @10Hz라, TRAJ_STRIDE_2HZ=5로 서브샘플해 미래프레임 +5,+10,…,+50
@@ -137,7 +138,9 @@ def _history_images(clip: Clip, f: Frame) -> Optional[list[dict]]:
 
 
 # _nearest_objects: 8뷰 GT 객체(Spatial.per_camera_results)를 track_token으로 중복 제거 + ego 거리순
-#   정렬해 가까운 max_n개를 {category,dist_m,fwd_m,left_m}로 반환(spatial 태스크·spatial reasoning 공용).
+#   정렬해 가까운 max_n개를 {category,dist_m,fwd_m,left_m,views}로 반환(spatial 태스크·spatial reasoning 공용).
+#   views = 이 객체가 **관측된 카메라 뷰 집합**(정렬 리스트) — selective-view에서 "입력된 뷰에 잡힌 객체만"
+#   spatial GT를 필터링하는 데 쓴다(train_traj_reas.reasoning_target의 allowed_views).
 def _nearest_objects(f: Frame, max_n: int = SPATIAL_MAX_OBJECTS) -> list[dict]:
     best: dict[str, dict] = {}                       # track_token → 가장 가까운 관측
     for v in CAMERA_VIEWS:
@@ -149,10 +152,18 @@ def _nearest_objects(f: Frame, max_n: int = SPATIAL_MAX_OBJECTS) -> list[dict]:
             dist = (x * x + y * y) ** 0.5
             cat = o.get("detection_label") or (o.get("category", "") or "").split(".")[-1] or "object"
             key = o.get("track_token") or f"{v}:{id(o)}"
-            if key not in best or dist < best[key]["dist_m"]:
+            if key not in best:
                 best[key] = {"category": cat, "dist_m": round(dist, 1),
-                             "fwd_m": round(x, 1), "left_m": round(y, 1)}
-    return sorted(best.values(), key=lambda d: d["dist_m"])[:max_n]
+                             "fwd_m": round(x, 1), "left_m": round(y, 1), "_views": {v}}
+            else:
+                best[key]["_views"].add(v)           # 같은 트랙이 여러 뷰에 잡히면 뷰 누적
+                if dist < best[key]["dist_m"]:       # 가장 가까운 관측으로 좌표 갱신
+                    best[key].update(category=cat, dist_m=round(dist, 1),
+                                     fwd_m=round(x, 1), left_m=round(y, 1))
+    objs = sorted(best.values(), key=lambda d: d["dist_m"])[:max_n]
+    for o in objs:                                   # set → 정렬 리스트(JSON 직렬화 가능)
+        o["views"] = sorted(o.pop("_views"))
+    return objs
 
 
 # frame_to_spatial_sft: 한 프레임을 spatial supervision 샘플로 변환(논문 A의 1Hz 인식 태스크).
@@ -278,14 +289,6 @@ def frame_to_trajectory_sft(f: Frame, n_points: int = TRAJ_N_POINTS,
     if len(wp) < n_points:                               # 고정 길이 미달 → 제외(패딩 대신 단순 제외)
         return None, "short_trajectory"
     out = {"waypoints": [[round(float(x), 2), round(float(y), 2), round(float(th), 3)] for x, y, th in wp]}
-    # selective-view용 기동 신호(연속값, 이산화는 학습/평가 시 thr로): ego-frame 미래궤적의 lateral(=left) 성분.
-    #   maneuver_lateral     = 최종(5초 뒤) lateral 변위(m). 부호=방향(+좌/−우), 크기=정도.
-    #   maneuver_max_lateral = 5초 내 |lateral| 최대(m). 차선변경(갔다 유지)은 둘 다 큼, 회피(갔다 복귀)는 max만 큼.
-    #   ⚠️ thr은 여기서 고정하지 않는다 — 원본 연속값만 심어 학습·평가에서 abs(·)<thr로 자유롭게 이산화(재빌드 불필요).
-    #   검증: Lateral 텍스트 라벨과 최종변위 3분류 일치 82~86%(analysis/maneuver_from_traj.py, thr 0.75~2.0).
-    lat = [float(row[1]) for row in wp]
-    out["maneuver_lateral"] = round(lat[-1], 3)
-    out["maneuver_max_lateral"] = round(max(lat, key=abs), 3)
     # gate_direction(정수 0/1/2): 과거에 관측된 가장 최근 Driving decision.Lateral을 이월한 값(인과 안전,
     #   미래 GT 미사용). selective-view 게이트 분류기(1단계 판단)의 학습 타깃 + 뷰 게이팅 인덱스로 쓴다.
     #   None이면(이 clip에 아직 Lateral 관측이 없거나 build 구버전) 필드 자체를 생략(하위호환).
@@ -300,6 +303,11 @@ def frame_to_trajectory_sft(f: Frame, n_points: int = TRAJ_N_POINTS,
         out["reasoning_parts"] = parts
         if "decision" in parts:                          # 하위호환: 기존 필드는 decision reasoning 유지
             out["reasoning"] = parts["decision"]
+        # spatial_objects: 뷰 태그 포함 구조화 객체(선택적 뷰 필터용). reasoning_parts.spatial(평문 top-8)은
+        #   하위호환/비필터 경로용으로 유지하고, selective-view는 이 리스트를 allowed_views로 필터해 spatial GT를
+        #   즉석 재구성한다(train_traj_reas.reasoning_target). 필터 후 top-8 확보 위해 넉넉히(≤40) 저장.
+        if "spatial" in parts:
+            out["spatial_objects"] = _nearest_objects(f, max_n=SPATIAL_OBJECTS_STORE_MAX)
     return {
         "id": f.sample_id + "_tj",                       # driving/spatial 샘플과 id 충돌 방지
         "clip_token": f.clip_token,

@@ -30,7 +30,8 @@ class RunLogger:
             self.run_dir = None
             self._fh = None
             return
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._start = datetime.now()          # 종료 시 총 소요시간 계산용(close()에서 사용)
+        stamp = self._start.strftime("%Y%m%d_%H%M%S")
         self.run_dir = RESULTS / tag / stamp
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self._fh = open(self.run_dir / "train.log", "w", buffering=1)  # line-buffered
@@ -93,7 +94,13 @@ class RunLogger:
         print(line)
         self._file(line)
 
+    # close: 학습+검증+최종평가가 전부 끝난 뒤 호출측(main)이 부른다 — 그 시점을 "완전 종료 시각"으로 기록.
     def close(self):
         if self._fh:
+            end = datetime.now()
+            dur = end - self._start
+            h, rem = divmod(int(dur.total_seconds()), 3600)
+            m, s = divmod(rem, 60)
+            self.info(f"=== run 종료: {end:%Y-%m-%d %H:%M:%S} (총 소요 {h}h{m:02d}m{s:02d}s) ===")
             self._fh.close()
             self._fh = None

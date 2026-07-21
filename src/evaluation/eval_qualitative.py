@@ -28,7 +28,7 @@ from sft_data.chat_format import view_caption                         # noqa: E4
 from evaluation.eval_trajectory import eval_out_dir                   # noqa: E402  (저장 위치 일관)
 from evaluation.bev import render_bev                                # noqa: E402  (HD맵+객체박스+궤적 BEV)
 from training.dit_head import TrajectoryDiT, TrajectoryNormalizer     # noqa: E402
-from training.train_traj_reas import encode_condition, ego_vec, history_for, load_vlm, gate_views, rec_maneuver   # noqa: E402
+from training.train_traj_reas import encode_condition, ego_vec, history_for, load_vlm   # noqa: E402
 
 # 8뷰 3×3 surround 배치(view_8cam.py와 동일). 중앙(1,1)은 GT 텍스트용.
 GRID_POS = {
@@ -255,20 +255,16 @@ def main() -> None:
     prompt_tpl = TRAJ_PROMPT_FILE.read_text()
     do_reas = not args.no_reasoning and vlm_mode != "frozen"   # frozen은 VLM 미학습 → reasoning 무의미
     temporal_on = cfg.get("temporal", False)              # 학습이 과거뷰를 썼으면 평가도 동일하게(일관)
-    man_thr = cfg.get("maneuver_lateral_thr", -1.0)       # selective-view 게이팅(학습과 동일 thr)
     print(f"qualitative eval on {len(chosen)} samples (reasoning={'on' if do_reas else 'off'}, "
-          f"temporal={'on' if temporal_on else 'off'}, "
-          f"selective-view={'thr='+str(man_thr)+'m' if man_thr is not None and man_thr >= 0 else 'off'})\n")
+          f"temporal={'on' if temporal_on else 'off'})\n")
 
     samples = []
     for i, rec in enumerate(chosen, 1):
         prompt = prompt_tpl.replace("{mission}", rec.get("mission") or "drive safely")
-        _ml = rec_maneuver(rec)
-        hist = gate_views(history_for(rec, temporal_on), _ml, man_thr)     # 과거 8뷰(temporal_on일 때만) 게이팅
-        # 1) 궤적 예측
+        hist = history_for(rec, temporal_on)              # 과거 8뷰(temporal_on일 때만), 게이팅 없음
+        # 1) 궤적 예측 (전 8뷰)
         with torch.no_grad():
-            cvec, mem, mem_mask = encode_condition(vlm, processor,
-                                                   gate_views(rec["images"], _ml, man_thr), prompt, hist)
+            cvec, mem, mem_mask = encode_condition(vlm, processor, rec["images"], prompt, hist)
             cond = cvec.unsqueeze(0).to("cuda:0"); mem = mem.to("cuda:0"); mem_mask = mem_mask.to("cuda:0")
         ego = torch.tensor([ego_vec(rec, dit.ego_dim)], dtype=torch.float32, device="cuda:0") \
             if dit.ego_dim > 0 else None
@@ -286,9 +282,7 @@ def main() -> None:
                         "images": rec["images"], "mission": rec.get("mission"),
                         "gt_reasoning": gt_reas,
                         "pred_reasoning": gen,            # 8뷰 가운데 요약에 표시
-                        # selective-view: 실제 VLM에 입력된 뷰 이름 집합(None=게이팅 off, 전 8뷰 입력).
-                        "gated_views": (sorted(im["view"] for im in gate_views(rec["images"], _ml, man_thr))
-                                       if man_thr is not None and man_thr >= 0 else None)})
+                        "gated_views": None})             # 전 8뷰(게이팅 off)
         print(f"[{i}/{len(chosen)}] {rec['id']}  ADE={d.mean():.2f}m FDE={d[-1]:.2f}m")
         if do_reas:
             print(f"    PRED: {gen[:200]}")

@@ -71,8 +71,8 @@ IMAGE_SQUARE: "int | None" = None
 # 어떤 SFT 빌드를 학습/평가에 쓸지 여기서 중앙 결정한다. build_sft.py는 이 경로에 {train,val}.jsonl을
 # 만들고(--out 미지정 시), train_traj_reas.py/eval_*.py는 이 경로를 기본 train/val로 읽는다(--train/--val로
 # override 가능). 새 빌드를 낼 때 기존을 덮지 않으려면 이 값만 바꾸면 된다(예: data/sft → data/sft_v2).
-#   sft    : 초기 빌드(기동 신호 없음).
-#   sft_v2 : maneuver_lateral/maneuver_max_lateral(selective-view 기동 신호) 포함 재빌드.
+#   sft    : 초기 빌드.
+#   sft_v2 : gate_direction(과거 결정 이월, selective-view 폐루프 게이트 타깃) 포함 재빌드.
 import pathlib as _pathlib
 _REPO = _pathlib.Path(__file__).resolve().parents[2]
 SFT_DIR: "_pathlib.Path" = _REPO / "data" / "sft_v2"
