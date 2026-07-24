@@ -99,7 +99,20 @@ def main():
     ap.add_argument("--min-free-gb", type=float, default=30.0,
                     help="이 여유공간 미만이면 중단(ZIP 임시분+안전마진). 기본 30GB.")
     ap.add_argument("--tmp", default=None, help="ZIP 임시 저장 위치(기본 clips-root/_zip_tmp)")
+    ap.add_argument("--retries", type=int, default=0,
+                    help="clip당 다운로드 재시도 횟수. **0=무한 재시도(기본)** — 네트워크가 끊겨도 성공할 때까지 "
+                         "계속 시도하므로 clip을 빠뜨리지 않는다. N>0이면 N회 실패 시 그 clip을 건너뛰고 진행.")
+    ap.add_argument("--max-backoff", type=int, default=300,
+                    help="재시도 대기 상한(초, 기본 300=5분). 지수 백오프(5→10→20…)가 이 값을 넘지 않는다.")
+    ap.add_argument("--timeout", type=int, default=60,
+                    help="HF 다운로드 네트워크 타임아웃(초, 기본 60). 서버가 연결을 끊고 응답이 없을 때 "
+                         "무한 대기(hang)하는 것을 막는다.")
     args = ap.parse_args()
+
+    # ⚠️ huggingface_hub는 **import 시점에** 이 환경변수를 읽어 타임아웃을 정한다 → import보다 먼저 설정.
+    #    (실제 사고: 서버가 소켓을 CLOSE-WAIT로 끊었는데 타임아웃이 없어 14시간 futex 대기로 멈춤)
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", str(args.timeout))
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(args.timeout))
 
     try:
         from huggingface_hub import HfApi, hf_hub_download
@@ -127,7 +140,7 @@ def main():
     _log(log_file, f"START [{mode}] repo={REPO_ID} parts={parts} "
                    f"target={g_total} clips | parts={{{', '.join(f'{p}:{len(z)}' for p, z in part_zips.items())}}}")
 
-    grand_done = grand_skip = 0
+    grand_done = grand_skip = grand_fail = 0
     g_seen = 0                                            # 전체에서 지금까지 처리(완료+스킵)한 clip 수
     t0 = time.time()
     for part in parts:
@@ -149,16 +162,44 @@ def main():
             free_gb = shutil.disk_usage(args.clips_root).free / 1e9
             if free_gb < args.min_free_gb:
                 _log(log_file, f"⚠️ 여유공간 {free_gb:.0f}GB < {args.min_free_gb}GB → 중단. 지금까지 {grand_done}개 완료.")
-                _summary(log_file, grand_done, grand_skip, t0); return
+                _summary(log_file, grand_done, grand_skip, grand_fail, t0); return
             os.makedirs(tmp_dir, exist_ok=True)
+            # 다운로드 재시도: 네트워크 끊김/타임아웃에도 clip을 빠뜨리지 않는다.
+            #   --retries 0(기본) = **무한 재시도**(지수 백오프, 상한 --max-backoff) → 회선이 복구되면
+            #   알아서 이어받는다. N>0이면 N회 실패 시 FAIL 기록 후 다음 clip으로 진행.
             local_zip = None
+            last_err = None
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    local_zip = hf_hub_download(REPO_ID, filename=zf_path, repo_type="dataset",
+                                                local_dir=tmp_dir, token=token)
+                    if attempt > 1:
+                        _log(log_file, f"  ✅ {name[:32]} {attempt}번째 시도에서 성공")
+                    break
+                except KeyboardInterrupt:
+                    raise                                 # Ctrl-C는 재시도 대상 아님(즉시 중단)
+                except Exception as e:                    # noqa: BLE001 (네트워크/HTTP 등 모든 실패 재시도)
+                    last_err = e
+                    local_zip = None
+                    if args.retries and attempt >= args.retries:
+                        break                             # 유한 재시도 모드에서 소진 → 건너뛰기
+                    wait = min(5 * (2 ** (attempt - 1)), args.max_backoff)   # 5,10,20,…(상한)
+                    _log(log_file, f"  ⚠️ {name[:32]} 다운로드 실패(시도 {attempt}"
+                                   f"{'/' + str(args.retries) if args.retries else ', 무한재시도'}) "
+                                   f"{type(e).__name__}: {str(e)[:80]} → {wait}s 후 재시도")
+                    time.sleep(wait)
+            g_seen += 1
+            if local_zip is None:                         # (유한 모드) 재시도 소진 → 이 clip 건너뛰고 계속
+                grand_fail += 1
+                _progress(log_file, part, i, len(zips), g_seen, g_total, t0,
+                          f"{name[:32]} FAIL:{type(last_err).__name__}")
+                continue
             try:
-                local_zip = hf_hub_download(REPO_ID, filename=zf_path, repo_type="dataset",
-                                            local_dir=tmp_dir, token=token)
                 tmp_clip = dest + ".partial"
                 shutil.rmtree(tmp_clip, ignore_errors=True)
                 r = selective_extract(local_zip, tmp_clip, args.history)
-                g_seen += 1
                 if r["status"] != "ok":
                     shutil.rmtree(tmp_clip, ignore_errors=True)
                     _progress(log_file, part, i, len(zips), g_seen, g_total, t0,
@@ -172,11 +213,14 @@ def main():
                 if local_zip and os.path.isfile(local_zip):
                     os.remove(local_zip)                  # ZIP 즉시 삭제(디스크 회수)
     shutil.rmtree(tmp_dir, ignore_errors=True)
-    _summary(log_file, grand_done, grand_skip, t0)
+    _summary(log_file, grand_done, grand_skip, grand_fail, t0)
 
 
-def _summary(log_file, done, skip, t0):
-    _log(log_file, f"DONE 추출 완료 clip: {done} | 이미 있어 스킵: {skip} | 총 {_fmt_dur(time.time() - t0)}")
+def _summary(log_file, done, skip, fail, t0):
+    msg = f"DONE 추출 완료 clip: {done} | 이미 있어 스킵: {skip} | 실패(건너뜀): {fail} | 총 {_fmt_dur(time.time() - t0)}"
+    if fail:
+        msg += "  ⚠️ 실패분은 스크립트를 다시 실행하면 재시도됩니다(완료분은 자동 스킵)."
+    _log(log_file, msg)
 
 
 if __name__ == "__main__":

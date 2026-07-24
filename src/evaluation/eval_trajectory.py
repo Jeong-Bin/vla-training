@@ -121,11 +121,13 @@ def main() -> None:
     dit.load_state_dict(torch.load(adapter / "dit_head.pt", map_location="cuda:0"))
     dit.eval()
     temporal_on = cfg.get("temporal", False)              # 학습이 과거뷰를 썼으면 평가도 동일하게(일관)
+    gate_num = cfg.get("gate_num", 3)                     # 3(구형 좌/우) 또는 5(turn 분리, 반대편 뷰)
     # 게이트 헤드(폐루프): gate_head.pt가 있으면 로드 → 게이트 예측으로 뷰 게이팅(closed-loop).
     gate_mod = None
     gate_path = adapter / "gate_head.pt"
     if cfg.get("gate_weight", 0) > 0 and gate_path.exists():
-        gate_mod = GateHead(cond_dim=cfg["cond_dim"], hidden=cfg.get("gate_hidden", 128)).to("cuda:0")
+        gate_mod = GateHead(cond_dim=cfg["cond_dim"], hidden=cfg.get("gate_hidden", 128),
+                            n_classes=gate_num).to("cuda:0")
         gate_mod.load_state_dict(torch.load(gate_path, map_location="cuda:0"))
         gate_mod.eval()
     temporal_clip = cfg.get("temporal_clip", False)          # clip 시간순 폐루프(진짜, Pass 구분 없음)
@@ -173,7 +175,7 @@ def main() -> None:
     def _accum(i, rec, pred_norm, pred_dir, t_ms):
         nonlocal gate_correct, gate_total
         if pred_dir is not None:
-            gd = rec_gate_direction(rec)
+            gd = rec_gate_direction(rec, gate_num)
             if gd is not None:
                 gate_total += 1; gate_correct += int(pred_dir == gd)
         pred_wp = normalizer.denormalize(pred_norm.cpu()).numpy()

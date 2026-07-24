@@ -202,20 +202,28 @@ def _decision_reasoning_text(f: Frame) -> Optional[str]:
     return (f.reasoning_trace() or "").strip() or None
 
 
-# GATE_LABEL: selective-view 게이팅용 3분류(정수). 0=직진(뷰 게이팅 없음), 1=좌, 2=우.
-#   Driving decision.Lateral(7종 자유값)을 방향 3종으로 통합(회전/차선변경/미세이동을 좌·우로 묶음) —
-#   게이팅이 필요한 건 "카메라를 어느 방향으로 켤까"뿐이라 세부 기동 종류는 불필요.
-GATE_LABEL = {"straight": 0, "left": 1, "right": 2}
+# GATE_LABEL: selective-view 게이팅용 **5분류**(정수)로 항상 저장 — 3-class는 train 쪽에서 런타임에
+#   5→3 다운캐스트(GATE5_TO_GATE3)해 만든다(정보 손실 없이 두 --gate-num 모드를 한 SFT로 지원).
+#   0=직진, 1=좌(미세이동/차선변경), 2=우(미세이동/차선변경), 3=좌회전(turn), 4=우회전(turn).
+#   turn(3/4)을 미세이동/차선변경(1/2)과 분리하는 이유: 90도 회전은 후측방 사각지대 위험이 lane-level
+#   조작과 질적으로 달라(반대편 후측방 차량 주의) selective-view가 다른 뷰 조합을 써야 하기 때문
+#   (train_traj_reas.gate_views_by_direction의 GATE_TURN_LEFT/RIGHT 참고).
+GATE_LABEL = {"straight": 0, "left": 1, "right": 2, "turn_left": 3, "turn_right": 4}
+GATE5_TO_GATE3 = {0: 0, 1: 1, 2: 2, 3: 1, 4: 2}   # 5-class → 3-class(turn을 좌/우로 재합류, 구형 호환)
 
 
-# _lateral_to_gate: Driving decision.Lateral 원문 문자열 → {straight,left,right}(없으면 None).
-#   analysis/maneuver_from_traj.py의 lateral_dir과 동일 매핑(검증된 3분류).
+# _lateral_to_gate: Driving decision.Lateral 원문 문자열 → GATE_LABEL 5종 키(없으면 None).
+#   "slightly move"/"lane change"는 left/right(1/2), "turn"은 turn_left/turn_right(3/4)로 분리.
 def _lateral_to_gate(lateral: str) -> Optional[str]:
     s = (lateral or "").strip().lower()
     if not s:
         return None
     if "no lateral" in s:
         return "straight"
+    if "turn" in s and "left" in s:
+        return "turn_left"
+    if "turn" in s and "right" in s:
+        return "turn_right"
     if "left" in s:
         return "left"
     if "right" in s:
@@ -425,9 +433,10 @@ def build(clips_root: Path, out_dir: Path, traj_stride: int = 10) -> dict:
             finals = [r["output"]["waypoints"][-1][0] for r in traj]        # 마지막 waypoint의 fwd(m)
             report["splits"][name]["traj_final_fwd_m_mean"] = round(sum(finals) / len(finals), 1)
             gd = Counter(r["output"]["gate_direction"] for r in traj if "gate_direction" in r["output"])
-            if gd:                                          # {0:straight,1:left,2:right} 이월 분포(selective-view)
+            if gd:                                          # GATE_LABEL 5종 이월 분포(selective-view)
+                gate_id_to_name = {v: k for k, v in GATE_LABEL.items()}
                 report["splits"][name]["gate_direction_dist"] = {
-                    {0: "straight", 1: "left", 2: "right"}[k]: v for k, v in gd.most_common()}
+                    gate_id_to_name[k]: v for k, v in gd.most_common()}
     report["val_clip_tokens_known"] = len(val_tokens)
     # 시간 맥락 설정 스냅샷(빌드 시점 vlm.py 값) — 데이터가 어떤 temporal 설정으로 만들어졌는지 추적.
     report["temporal"] = {"enabled": TEMPORAL, "history_offset": TEMPORAL_HISTORY_OFFSET}

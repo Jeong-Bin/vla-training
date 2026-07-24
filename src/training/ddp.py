@@ -48,7 +48,13 @@ def setup():
         import torch.distributed as dist
 
         if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
+            from datetime import timedelta
+            # 기본 NCCL 타임아웃(10분)은 rank0 단독 run_final_eval(전체 val 8뷰 BEV 시각화+폐루프 추론,
+            # --final-eval-limit 0 + selective-view면 10분을 쉽게 넘김) 동안 다른 rank가 ddp.cleanup()의
+            # barrier에서 먼저 도착해 굶어 죽는 실제 장애를 낳았다(watchdog이 ALLREDUCE/barrier 타임아웃으로
+            # 전 rank를 SIGABRT). run_final_eval은 collective가 없는 rank0 단독 구간이라 다른 rank는 그저
+            # 기다리기만 하면 되므로, 그 대기를 감당할 만큼 타임아웃을 넉넉히(60분) 늘린다.
+            dist.init_process_group(backend="nccl", timeout=timedelta(minutes=60))
     return f"cuda:{lr}"
 
 

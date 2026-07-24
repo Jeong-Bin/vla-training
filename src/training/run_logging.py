@@ -23,6 +23,11 @@ RESULTS = REPO / "results"
 #   tag       = "traj_reas" | "text_sft" (results/<tag>/<timestamp>/ 하위에 모든 산출물)
 #   is_main   = DDP rank0 여부(False면 모든 출력/기록이 no-op → 중복·경쟁 방지)
 class RunLogger:
+    # active: 가장 최근에 생성된 rank0 RunLogger(모듈 레벨로 추적). main()의 학습 루프 어디서든 미처리
+    #   예외가 나면, 호출부(if __name__=="__main__")가 이 인스턴스를 찾아 error()로 train.log에 남긴다
+    #   — main() 내부를 통째로 try/except로 재들여쓰기하지 않고도 "예외=로그 없이 사라짐"을 없앤다.
+    active: "RunLogger | None" = None
+
     def __init__(self, tag: str, is_main: bool = True):
         self.is_main = is_main
         self._live_open = False              # 현재 줄에 덮어쓰기 중인 step 라인이 떠 있는가
@@ -36,6 +41,7 @@ class RunLogger:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self._fh = open(self.run_dir / "train.log", "w", buffering=1)  # line-buffered
         self._file(f"=== run {tag}/{stamp} ===")
+        RunLogger.active = self
 
     # path: 이 실행의 산출물(모델/메트릭 등)을 둘 경로 헬퍼.
     def path(self, *parts) -> Path:
@@ -64,23 +70,40 @@ class RunLogger:
         self._live_open = True
 
     # epoch: 한 epoch 종합을 출력. 떠 있던 step 줄을 개행으로 마감한 뒤, 영구 줄을 터미널+파일에 남긴다.
-    #   train_loss = 그 epoch 평균 train loss
-    #   eval       = (선택) {지표: 값} dict. eval을 건너뛴 epoch면 None.
-    # 형식: "epoch 1 | train_loss 2.10 | EVAL val_loss 8.28 val_lm 2.81 | step 389/389"
-    #       → eval 지표는 "EVAL" 태그 뒤에 모아 학습 손실과 시각적으로 구분한다.
-    def epoch(self, epoch: int, train_loss: float, eval: dict | None = None, extra: str = ""):
+    #   train_loss    = 그 epoch 평균 train loss(flow 기준, 하위호환 유지)
+    #   train_metrics = (선택) {"flow_avg":..,"lm_avg":..,"gate_ce_avg":..} 등 train 쪽 세부 평균. selective_view
+    #                   설정에 따라 lm/gate_ce가 없을 수 있어(--reasoning-types 無 / --gate-weight 0) 호출측이
+    #                   존재하는 키만 채워 넘긴다 — 여기선 그대로 나열만 한다.
+    #   eval          = (선택) {지표: 값} dict. eval을 건너뛴 epoch면 None.
+    # 형식: "epoch 1 | train_loss 2.10 | TRAIN flow_avg 2.05 lm_avg 0.62\n"
+    #       "                              | EVAL val_loss 8.28 | step 389/389"
+    #       → train_metrics까지는 한 줄(| 구분), EVAL부터는 줄바꿈 후 "epoch N | train_loss X.XX | " 폭만큼
+    #         들여써 이어붙인다(train/eval 두 블록을 시각적으로 분리하되 같은 epoch 줄임을 들여쓰기로 표시).
+    #         eval이 없으면(그 epoch에 검증을 안 함) 줄바꿈 없이 1줄 그대로.
+    def epoch(self, epoch: int, train_loss: float, train_metrics: dict | None = None,
+              eval: dict | None = None, extra: str = ""):
         if not self.is_main:
             return
         if self._live_open:                  # 덮어쓰던 step 줄을 마감(다음 출력이 안 겹치게)
             sys.stdout.write("\n")
             self._live_open = False
-        parts = [f"epoch {epoch}", f"train_loss {train_loss:.4f}"]
+        indent_ref = f"epoch {epoch} | train_loss {train_loss:.4f} "   # 들여쓰기 기준 폭(TRAIN 블록 제외)
+        head_parts = [f"epoch {epoch}", f"train_loss {train_loss:.4f}"]
+        if train_metrics:                    # train 세부 평균은 "TRAIN " 접두로 한 덩어리(첫 줄에 유지)
+            tm = " ".join(f"{k} {v:.4f}" if isinstance(v, float) else f"{k} {v}" for k, v in train_metrics.items())
+            head_parts.append(f"TRAIN {tm}")
+        head = " | ".join(head_parts)
+        tail_parts = []
         if eval:                             # eval 지표는 "EVAL " 접두로 한 덩어리(학습/검증 구분 명확화)
             ev = " ".join(f"{k} {v:.4f}" if isinstance(v, float) else f"{k} {v}" for k, v in eval.items())
-            parts.append(f"EVAL {ev}")
+            tail_parts.append(f"EVAL {ev}")
         if extra:
-            parts.append(extra)
-        line = " | ".join(parts)
+            tail_parts.append(extra)
+        if tail_parts:                       # EVAL/extra는 줄바꿈 후 "epoch N | train_loss X.XX " 폭만큼 들여씀
+            indent = " " * len(indent_ref)
+            line = head + "\n" + indent + "| " + " | ".join(tail_parts)
+        else:
+            line = head
         print(line)                          # 터미널 영구 줄
         self._file(line)                     # 로그 파일(종합만)
 
@@ -94,6 +117,17 @@ class RunLogger:
         print(line)
         self._file(line)
 
+    # error: 학습/검증 중 처리 못한 예외가 올라올 때 호출측(main의 바깥 try/except)이 부른다.
+    #   스택트레이스 전체를 train.log 마지막에 이어붙인다 — 지금까지는 미처리 예외가 로그 없이 stderr로만
+    #   사라져(로그가 "running final eval ..." 같은 데서 뚝 끊김) 원인 파악이 어려웠던 문제를 없앤다.
+    #   close()보다 먼저 불러야 한다(파일이 아직 열려 있어야 기록됨) — main()이 finally에서 순서 보장.
+    def error(self, exc: BaseException):
+        if not self.is_main:
+            return
+        import traceback
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        self.info(f"=== 에러 발생: {datetime.now():%Y-%m-%d %H:%M:%S} ===\n{tb.rstrip()}")
+
     # close: 학습+검증+최종평가가 전부 끝난 뒤 호출측(main)이 부른다 — 그 시점을 "완전 종료 시각"으로 기록.
     def close(self):
         if self._fh:
@@ -104,3 +138,5 @@ class RunLogger:
             self.info(f"=== run 종료: {end:%Y-%m-%d %H:%M:%S} (총 소요 {h}h{m:02d}m{s:02d}s) ===")
             self._fh.close()
             self._fh = None
+        if RunLogger.active is self:
+            RunLogger.active = None

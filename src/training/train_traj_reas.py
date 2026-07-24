@@ -182,22 +182,29 @@ def history_for(rec: dict, temporal_on: bool):
 
 
 # ─── selective-view 뷰 부분집합 상수 ────────────────────────────────────────────────────────
-# 방향(0=straight/1=left/2=right)에 따라 VLM에 투입할 카메라 뷰 부분집합. gate_views_by_direction이 사용.
+# 방향(GATE_LABEL 참고)에 따라 VLM에 투입할 카메라 뷰 부분집합. gate_views_by_direction이 사용.
 #   항상: 전면 3뷰(front_left=CAM_M_L0, front=CAM_M_F, front_right=CAM_M_R0)
-#   left : 좌측 3뷰 추가(left=CAM_M_L1, back_left=CAM_M_L2, back=CAM_M_B)
-#   right: 우측 3뷰 추가(right=CAM_M_R1, back_right=CAM_M_R2, back=CAM_M_B)
+#   left(1) : 좌측 3뷰 추가(left=CAM_M_L1, back_left=CAM_M_L2, back=CAM_M_B)
+#   right(2): 우측 3뷰 추가(right=CAM_M_R1, back_right=CAM_M_R2, back=CAM_M_B)
+#   turn_left(3) : **반대편(우측)** 3뷰 추가 — 90도 좌회전 시 우후측방 사각지대(합류·횡단 차량) 주의.
+#   turn_right(4): **반대편(좌측)** 3뷰 추가 — 90도 우회전 시 좌후측방 사각지대 주의.
+#   turn이 "가는 방향"이 아니라 "반대편"을 여는 이유: 큰 각도 회전은 진행 방향의 사각지대보다, 회전축
+#   반대쪽에서 넓게 다가오는 교차 교통(예: 우회전 시 왼쪽에서 오는 직진 차량/자전거)이 실제 위험원이라서.
 GATE_ALWAYS = ("front_left", "front", "front_right")     # CAM_M_L0 / CAM_M_F / CAM_M_R0
 GATE_LEFT = ("left", "back_left", "back")                # CAM_M_L1 / CAM_M_L2 / CAM_M_B
 GATE_RIGHT = ("right", "back_right", "back")             # CAM_M_R1 / CAM_M_R2 / CAM_M_B
+GATE_TURN_LEFT = GATE_RIGHT     # turn_left(3) → 반대편(우측) 뷰를 연다
+GATE_TURN_RIGHT = GATE_LEFT     # turn_right(4) → 반대편(좌측) 뷰를 연다
 
 
 # ─── selective-view 게이팅(gate_direction 기반 뷰 on/off, 폐루프용) ────────────────────────────
-# gate_views와 달리 **이산 방향 라벨**(0=straight/1=left/2=right)로 뷰를 켠다. 이 라벨의 출처는:
+# gate_views와 달리 **이산 방향 라벨**(GATE_LABEL: 0=straight/1=left/2=right/3=turn_left/4=turn_right)로
+# 뷰를 켠다. 이 라벨의 출처는:
 #   학습: build_sft가 심은 gate_direction GT(과거 결정 이월, teacher-forcing).
 #   추론: 게이트가 이전 프레임에서 예측한 방향(진짜 폐루프).
 # direction=None(과거 관측 없음=clip 첫 구간)이면 안전하게 전 8뷰(baseline) 유지 — 아직 방향을 모르므로.
 def gate_views_by_direction(image_recs, direction):
-    """direction: 0=straight/1=left/2=right/None(전뷰). None이면 게이팅 안 함(전 8뷰)."""
+    """direction: GATE_LABEL 값(0~4) 또는 None(전뷰). None이면 게이팅 안 함(전 8뷰)."""
     if image_recs is None:
         return None
     if direction is None:                                # 방향 미상(첫 구간) → 안전하게 전뷰
@@ -207,13 +214,34 @@ def gate_views_by_direction(image_recs, direction):
         keep |= set(GATE_LEFT)
     elif direction == 2:                                 # right
         keep |= set(GATE_RIGHT)
+    elif direction == 3:                                 # turn_left → 반대편(우측) 오픈
+        keep |= set(GATE_TURN_LEFT)
+    elif direction == 4:                                 # turn_right → 반대편(좌측) 오픈
+        keep |= set(GATE_TURN_RIGHT)
     # direction==0(straight)면 전면 3뷰만
     return [im for im in image_recs if im.get("view") in keep]
 
 
-def rec_gate_direction(rec: dict):
-    """레코드의 gate_direction(0/1/2, 과거 결정 이월 GT). 없으면 None."""
-    return (rec.get("output") or {}).get("gate_direction")
+# GATE5_TO_GATE3: build_sft가 항상 5-class(0=straight/1=left/2=right/3=turn_left/4=turn_right)로 저장한
+#   gate_direction을 --gate-num 3 모드에서 구형 3-class로 다운캐스트(turn_left→left, turn_right→right).
+#   build_sft.GATE5_TO_GATE3와 동일 매핑(SFT 재빌드 없이 두 --gate-num 모드를 한 데이터로 지원).
+GATE5_TO_GATE3 = {0: 0, 1: 1, 2: 2, 3: 1, 4: 2}
+
+# GATE_CLASS_NAMES: gate_num별 {클래스 정수: 짧은 이름}(0=straight 제외 — recall은 뷰 게이팅이 필요한
+#   비-직진 클래스만 본다). val_gate_recall_{name} 지표 키·로그에 쓰인다.
+GATE_CLASS_NAMES = {
+    3: {1: "left", 2: "right"},
+    5: {1: "left", 2: "right", 3: "turn_left", 4: "turn_right"},
+}
+
+
+def rec_gate_direction(rec: dict, gate_num: int = 5):
+    """레코드의 gate_direction GT. gate_num=5(기본)면 원본 5-class 그대로, 3이면 GATE5_TO_GATE3로
+    다운캐스트한 3-class. 없으면 None."""
+    gd = (rec.get("output") or {}).get("gate_direction")
+    if gd is None:
+        return None
+    return GATE5_TO_GATE3[gd] if gate_num == 3 else gd
 
 
 # is_keyframe: 이 trajectory 레코드가 **decision 프레임**(0.2Hz, Driving decision 채워진 프레임, clip당 3개)인가.
@@ -490,7 +518,7 @@ class TrajTrainSet:
     dict를 돌려주는 map-style 데이터셋(DataLoader 워커에서 실행). torch.utils.data.Dataset을 상속하지
     않아도 __len__/__getitem__만 있으면 DataLoader가 받는다."""
     def __init__(self, records, processor, prompt_tpl, temporal_on, reasoning_types, joint, ego_dim,
-                 gate_teacher_forcing=False):
+                 gate_teacher_forcing=False, gate_num=3):
         self.records = records
         self.processor = processor
         self.prompt_tpl = prompt_tpl
@@ -501,6 +529,7 @@ class TrajTrainSet:
         # gate_teacher_forcing=True(--gate-weight>0): gate_direction GT(과거 결정 이월값)로 뷰 게이팅
         #   (teacher-forcing). 추론 땐 게이트 실제 예측을 씀(진짜 폐루프). False면 전 8뷰(게이팅 없음).
         self.gate_teacher_forcing = gate_teacher_forcing
+        self.gate_num = gate_num                            # 3(구형 좌/우 통합) 또는 5(turn 분리)
 
     def __len__(self):
         return len(self.records)
@@ -509,7 +538,7 @@ class TrajTrainSet:
         rec = self.records[i]
         prompt = self.prompt_tpl.replace("{mission}", rec.get("mission") or "drive safely")
         if self.gate_teacher_forcing:                       # 폐루프 학습: gate_direction GT로 뷰 게이팅
-            gdir = rec_gate_direction(rec)                  # 0/1/2/None(첫 구간→전뷰)
+            gdir = rec_gate_direction(rec, self.gate_num)   # 0~2(gate_num=3) 또는 0~4(gate_num=5)/None
             imgs = gate_views_by_direction(rec["images"], gdir)
             hist = gate_views_by_direction(history_for(rec, self.temporal_on), gdir)
         else:                                               # 게이팅 없음 → 전 8뷰
@@ -679,7 +708,7 @@ class TrajReasVLA(nn.Module):
 def clip_rollout_forward(vlm, dit, gate, normalizer, processor, prompt_tpl, clip_recs, device, grad_scale,
                          *, train_vlm, joint, reasoning_types, ego_dim, temporal_on,
                          reas_weight, gate_weight, gate_alpha, gate_focal_gamma, selective_view,
-                         forcing="student"):
+                         forcing="student", gate_num=3):
     import torch
 
     if gate_alpha is not None:
@@ -717,8 +746,8 @@ def clip_rollout_forward(vlm, dit, gate, normalizer, processor, prompt_tpl, clip
             lm_sum += float(lm_loss); lm_n += 1
         # 게이트: 현재 프레임 gate_direction GT로 focal 지도 + 다음 프레임 뷰용 dir 예측
         if gate is not None:
-            logits = gate(cond)                            # (1,3)
-            gd = rec_gate_direction(rec)                   # 현재 프레임 GT(게이트 손실 타깃 — 게이팅 소스 아님)
+            logits = gate(cond)                            # (1, gate_num)
+            gd = rec_gate_direction(rec, gate_num)          # 현재 프레임 GT(게이트 손실 타깃 — 게이팅 소스 아님)
             if gate_weight > 0 and gd is not None:
                 gce = focal_loss(logits, torch.tensor([gd], dtype=torch.long, device=device),
                                  alpha=gate_alpha, gamma=gate_focal_gamma)
@@ -727,7 +756,7 @@ def clip_rollout_forward(vlm, dit, gate, normalizer, processor, prompt_tpl, clip
             else:                                          # gate 라벨 없는 프레임: 0-더미로 head 그래프 유지
                 frame_loss = frame_loss + 0.0 * logits.float().mean()
             prev_dir = int(logits.argmax(-1).item())       # 다음 프레임 student 게이팅용(폐루프, item()=detach)
-        prev_gt_dir = rec_gate_direction(rec)              # 다음 프레임 teacher 게이팅용(현재 프레임 GT → 다음의 t-1 GT)
+        prev_gt_dir = rec_gate_direction(rec, gate_num)     # 다음 프레임 teacher 게이팅용(현재 프레임 GT → 다음의 t-1 GT)
         (frame_loss * grad_scale).backward()               # 프레임별 즉시 backward → 그래프 해제(메모리 안전)
     stats = {"n": n, "flow_sum": flow_sum, "lm_sum": lm_sum, "lm_n": lm_n,
              "gate_sum": gate_sum, "gate_n": gate_n}
@@ -743,7 +772,7 @@ def evaluate(vlm, dit_mod, processor, val_records, prompt_tpl, normalizer, reas_
              temporal_on=False, reasoning_types=(),
              gate_mod=None, gate_weight=0.0, gate_alpha=None, gate_focal_gamma=2.0,
              temporal_clip=False, selective_view=False, forcing="student", keyframe_eval=False,
-             keyframe_select=(0, 1, 2)):
+             keyframe_select=(0, 1, 2), gate_num=3):
     import torch
 
     was_training = dit_mod.training
@@ -759,9 +788,9 @@ def evaluate(vlm, dit_mod, processor, val_records, prompt_tpl, normalizer, reas_
     n = lm_n = 0
     gate_ce_sum = gate_n = 0.0
     gate_correct = 0.0
-    # 클래스별 (correct, total) — 안전 지표: left/right(측면 뷰 필요) 재현율을 특히 확인.
-    gate_cls_correct = {0: 0.0, 1: 0.0, 2: 0.0}
-    gate_cls_total = {0: 0.0, 1: 0.0, 2: 0.0}
+    # 클래스별 (correct, total) — 안전 지표: 측후방 뷰가 필요한 클래스들의 재현율을 특히 확인.
+    gate_cls_correct = {c: 0.0 for c in range(gate_num)}
+    gate_cls_total = {c: 0.0 for c in range(gate_num)}
 
     # _accum_loss: 한 프레임의 (cond, lml)로 flow/lm/gate_ce **손실만** 집계(val_loss = 학습과 동일 게이팅
     #   기준이어야 학습 신호와 일관). gate 예측(pred_dir)은 반환하되 정확도 집계는 여기서 하지 않는다
@@ -778,7 +807,7 @@ def evaluate(vlm, dit_mod, processor, val_records, prompt_tpl, normalizer, reas_
         if gate_mod is not None:
             logits = gate_mod(cond)
             pred_dir = int(logits.argmax(-1).item())
-            gd = rec["output"].get("gate_direction")
+            gd = rec_gate_direction(rec, gate_num)
             if gd is not None:
                 ce = float(focal_loss(logits, torch.tensor([gd], device=device),
                                       alpha=gate_alpha, gamma=gate_focal_gamma))
@@ -797,7 +826,7 @@ def evaluate(vlm, dit_mod, processor, val_records, prompt_tpl, normalizer, reas_
             return None
         logits = gate_mod(cond)
         pred_dir = int(logits.argmax(-1).item())
-        gd = rec["output"].get("gate_direction")
+        gd = rec_gate_direction(rec, gate_num)
         if gd is not None:
             gate_cls_total[gd] += 1
             if pred_dir == gd:
@@ -844,7 +873,7 @@ def evaluate(vlm, dit_mod, processor, val_records, prompt_tpl, normalizer, reas_
                         pd = _accum_gate_metrics(rec, cond_cl) if kf \
                             else int(gate_mod(cond_cl).argmax(-1).item())
                         prev_dir = pd                      # 다음 프레임 student 게이팅용(매 프레임 갱신)
-                    prev_gt_dir = rec_gate_direction(rec)  # 다음 프레임 teacher 게이팅용(현재 GT → 다음의 t-1 GT)
+                    prev_gt_dir = rec_gate_direction(rec, gate_num)  # 다음 프레임 teacher 게이팅용(현재 GT → t-1 GT)
         else:
             # 프레임 독립 경로: keyframe_eval이면 선택된 keyframe만 남겨 샤딩(rank 부하 균형 + 채점 대상 일치).
             idxs = [i for i in range(len(val_records))
@@ -864,12 +893,16 @@ def evaluate(vlm, dit_mod, processor, val_records, prompt_tpl, normalizer, reas_
         dit_mod.train()
     if gate_mod is not None and gate_was_training:
         gate_mod.train()
-    # 전 rank 부분합/개수 집계(한 번의 collective). 모든 rank가 호출 → 동기화 보장.
+    # 전 rank 부분합/개수 집계(한 번의 collective). 모든 rank가 호출 → 동기화 보장. 클래스별 correct/total은
+    # gate_num 길이만큼 동적으로 꼬리에 붙인다(all_reduce_sum은 임의 길이 리스트 지원).
+    cls_correct_vals = [gate_cls_correct[c] for c in range(gate_num)]
+    cls_total_vals = [gate_cls_total[c] for c in range(gate_num)]
     reduce_vals = [flow_sum, tot_sum, lm_sum, n, lm_n, gate_ce_sum, gate_n, gate_correct,
-                  gate_cls_correct[0], gate_cls_correct[1], gate_cls_correct[2],
-                  gate_cls_total[0], gate_cls_total[1], gate_cls_total[2]]
-    (g_flow, g_tot, g_lm, g_n, g_lm_n, g_gate_ce, g_gate_n, g_gate_correct,
-     g_c0, g_c1, g_c2, g_t0, g_t1, g_t2) = ddp.all_reduce_sum(reduce_vals)
+                  *cls_correct_vals, *cls_total_vals]
+    reduced = ddp.all_reduce_sum(reduce_vals)
+    (g_flow, g_tot, g_lm, g_n, g_lm_n, g_gate_ce, g_gate_n, g_gate_correct) = reduced[:8]
+    g_cls_correct = reduced[8:8 + gate_num]
+    g_cls_total = reduced[8 + gate_num:8 + 2 * gate_num]
     if g_n == 0:                                          # val에 trajectory 샘플이 전혀 없으면
         return None
     out = {"val_loss": g_tot / g_n, "val_flow": g_flow / g_n}
@@ -880,11 +913,10 @@ def evaluate(vlm, dit_mod, processor, val_records, prompt_tpl, normalizer, reas_
         # 정확도(_accum_gate_metrics, 항상 closed-loop 게이팅 — leakage 없음). g_gate_n과 분모가 같은 이유:
         # 두 함수 모두 프레임마다 정확히 1번씩, 같은 gate_direction is not None 조건으로 카운트하므로 항상 동수.
         out["val_gate_acc"] = g_gate_correct / g_gate_n
-        # 안전 지표: left/right(측면 뷰 필요) 재현율 — 이게 낮으면 게이트가 방향 전환을 놓쳐 뷰를 못 킴.
-        if g_t1 > 0:
-            out["val_gate_recall_left"] = g_c1 / g_t1
-        if g_t2 > 0:
-            out["val_gate_recall_right"] = g_c2 / g_t2
+        # 클래스별 재현율(측후방 뷰가 필요한 클래스가 낮으면 게이트가 그 상황을 놓쳐 뷰를 못 킴).
+        for c, name in GATE_CLASS_NAMES.get(gate_num, {}).items():
+            if g_cls_total[c] > 0:
+                out[f"val_gate_recall_{name}"] = g_cls_correct[c] / g_cls_total[c]
     return out
 
 
@@ -923,6 +955,7 @@ def run_final_eval(vlm_mod, dit_mod, processor, normalizer, cfg, prompt_tpl, dev
     gate_correct = 0; gate_total = 0                          # 폐루프 게이트 예측 정확도(gate_direction GT 대비)
     temporal_clip = cfg.get("temporal_clip", False)
     selective_view = cfg.get("selective_view", False)
+    gate_num = cfg.get("gate_num", 3)                          # 3(구형 좌/우) 또는 5(turn 분리, 반대편 뷰)
     keyframe_eval = cfg.get("keyframe_eval", False)           # 논문 정렬: keyframe(decision, 0.2Hz)만 채점
     keyframe_select = tuple(cfg.get("keyframe_select", [1]))   # clip당 decision 3개 중 채점 순서(기본 [1]=정중앙)
     kf_ids = select_keyframe_ids(ade_recs, keyframe_select) if keyframe_eval else None
@@ -944,7 +977,7 @@ def run_final_eval(vlm_mod, dit_mod, processor, normalizer, cfg, prompt_tpl, dev
     def _accum(rec, pred_norm, pred_dir):
         nonlocal gate_correct, gate_total
         if pred_dir is not None:
-            gd = rec_gate_direction(rec)
+            gd = rec_gate_direction(rec, gate_num)
             if gd is not None:
                 gate_total += 1; gate_correct += int(pred_dir == gd)
         pred_wp = normalizer.denormalize(pred_norm.cpu()).numpy()
@@ -1177,7 +1210,13 @@ def main() -> None:
                          "μ·gate_CE. 0(기본)=게이트 헤드 비활성. >0이면 GateHead 학습 — 타깃은 build_sft가 심은 "
                          "gate_direction(과거 결정 이월값, 인과 안전).")
     ap.add_argument("--gate-hidden", dest="gate_hidden", type=int, default=128,
-                    help="GateHead 은닉 차원(작은 MLP: cond_dim→hidden→3).")
+                    help="GateHead 은닉 차원(작은 MLP: cond_dim→hidden→gate_num).")
+    ap.add_argument("--gate-num", dest="gate_num", type=int, choices=[3, 5], default=3,
+                    help="selective-view 게이트 분류 수. 3(기본, 구형)=straight/left/right — Lateral 7종을 "
+                         "직진·좌·우로만 통합, 뷰는 항상 가는 방향 3뷰 추가. 5=straight/left/right/turn_left/"
+                         "turn_right — 'Turn left/right'를 별도 클래스로 분리하고, turn일 때는 **반대편** "
+                         "3뷰(back+반대측 2뷰)를 추가(90도 회전 시 반대편 사각지대 교차 교통 주의). "
+                         "build_sft가 항상 5-class로 저장하므로 재빌드 없이 두 값 다 사용 가능(3은 다운캐스트).")
     ap.add_argument("--gate-focal-gamma", dest="gate_focal_gamma", type=float, default=2.0,
                     help="게이트 focal loss의 감쇠 지수 γ(Lin et al. 2017). 0=순수 class-weighted CE. "
                          "클수록 이미 잘 맞추는 다수클래스(직진) 손실을 더 강하게 억제해 소수클래스(좌/우)에 집중.")
@@ -1213,6 +1252,12 @@ def main() -> None:
                          "넣어 waypoint가 self-attention으로 참조. --no-ego-state-token이면 구형(ego→AdaLN) 방식.")
     ap.add_argument("--limit", type=int, default=0, help="subset train for a quick run (0=all)")
     ap.add_argument("--max-steps", type=int, default=-1, help="cap optimizer steps (smoke test); -1=use epochs")
+    ap.add_argument("--fast-val", dest="fast_val", action=argparse.BooleanOptionalAction, default=False,
+                    help="검증 파이프라인에 에러가 없는지만 빠르게 확인하는 스모크 모드. 켜면 1 epoch의 "
+                         "**첫 step만 학습**하고(--max-steps 1과 동일) 바로 evaluate → 저장 → "
+                         "run_final_eval까지 전체 경로를 1회씩만 통과시킨다(--eval-every/--final-eval-limit도 "
+                         "자동으로 최소화). --max-steps/--eval-every/--final-eval-limit를 직접 지정했으면 "
+                         "그 값이 우선(이 플래그는 미지정 항목만 채움).")
     ap.add_argument("--seed", type=int, default=SEED,
                     help=f"랜덤 시드(torch.manual_seed + DataLoader 셔플 generator + epoch별 clip 셔플). "
                          f"기본={SEED}(vlm.SEED). 재현성 확인·시드 스윕용으로 --seed로 override.")
@@ -1228,6 +1273,19 @@ def main() -> None:
     ap.add_argument("--final-eval-per-page", type=int, default=6,
                     help="격자 1장당 장면 수(_1/_2/_3 페이지 분할 + 8뷰 1/2/3 폴더 단위)")
     args = ap.parse_args()
+
+    # --fast-val: 검증 파이프라인 스모크 테스트용. 1 step만 학습하고 evaluate→저장→run_final_eval까지
+    #   전체 경로를 최소 표본으로 1회씩 통과시켜 에러 유무만 빠르게 확인한다. 각 항목이 argparse 기본값
+    #   그대로면(=사용자가 명시적으로 안 건드렸으면)만 덮어써 명시적 지정을 존중한다.
+    if args.fast_val:
+        if args.max_steps == -1:               # 미지정이면 1 step으로 캡(그 즉시 done=True → evaluate 진입)
+            args.max_steps = 1
+        if args.eval_every == 1:                # 이미 매 epoch 검증이 기본이라 대개 그대로 두면 됨
+            args.eval_every = 1
+        if args.final_eval_limit == 0:          # 미지정(0=전체)이면 소수 샘플로 최종eval도 빠르게
+            args.final_eval_limit = 5
+        if args.final_eval_viz == 18:           # BEV 시각화도 최소화
+            args.final_eval_viz = 2
 
     import torch
     # DDP: torchrun이면 프로세스 그룹 초기화 + 이 rank의 GPU 고정. 단일 실행이면 device만 잡고 폴백.
@@ -1357,19 +1415,20 @@ def main() -> None:
     gate_mod = None
     gate_alpha = None
     if gate_on:
-        gate_counts = Counter(r["output"].get("gate_direction") for r in ds.records)
+        gate_counts = Counter(rec_gate_direction(r, args.gate_num) for r in ds.records)  # gate_num 다운캐스트 반영
         n_g = sum(v for k, v in gate_counts.items() if k is not None)
         if n_g == 0:
             raise SystemExit("--gate-weight>0인데 gate_direction 있는 trajectory 샘플이 0개 — "
                              "build_sft.py 재빌드(gate_direction 필드) 필요.")
-        freq = torch.tensor([gate_counts.get(0, 0), gate_counts.get(1, 0), gate_counts.get(2, 0)],
+        freq = torch.tensor([gate_counts.get(c, 0) for c in range(args.gate_num)],
                             dtype=torch.float32) / n_g
         inv = 1.0 / freq.clamp_min(1e-6)
         gate_alpha = inv / inv.mean()               # 평균 1로 정규화(전체 손실 스케일 유지)
-        gate_mod = GateHead(cond_dim=cond_dim, hidden=args.gate_hidden).to(device)
+        gate_mod = GateHead(cond_dim=cond_dim, hidden=args.gate_hidden, n_classes=args.gate_num).to(device)
         if fit_conds is not None:                   # DiT와 동일 cond 통계 재사용(별 fit 불필요)
             gate_mod.set_cond_stats(fit_conds.mean(0), fit_conds.std(0))
-        log(f"gate head: ON | class dist(0=straight,1=left,2=right)={dict(gate_counts)} | "
+        _cls_lbl = {3: "0=straight,1=left,2=right", 5: "0=straight,1=left,2=right,3=turn_left,4=turn_right"}
+        log(f"gate head: ON | gate_num={args.gate_num} | class dist({_cls_lbl[args.gate_num]})={dict(gate_counts)} | "
             f"alpha(class weight)={[round(a,3) for a in gate_alpha.tolist()]} | "
             f"focal_gamma={args.gate_focal_gamma} | weight(μ)={args.gate_weight}")
         _train_gate = ("이전 프레임 gate_direction GT(t-1)로 뷰 게이팅(teacher-forcing)" if args.forcing == "teacher"
@@ -1511,7 +1570,7 @@ def main() -> None:
     if not args.temporal_clip:
         train_set = TrajTrainSet([ds.records[i] for i in my_indices], processor, prompt_tpl,
                                  temporal_on, reasoning_types, joint, ego_dim,
-                                 gate_teacher_forcing=(args.gate_weight > 0))
+                                 gate_teacher_forcing=(args.gate_weight > 0), gate_num=args.gate_num)
         loader_kwargs = dict(batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
                              collate_fn=partial(collate_traj, pad_id=pad_id),
                              pin_memory=torch.cuda.is_available(), drop_last=False,
@@ -1553,7 +1612,14 @@ def main() -> None:
     best_gate_sd = None
     while not done:
         epoch += 1
-        ep_loss_sum, ep_n = 0.0, 0                          # 이 epoch 평균 train loss 집계
+        ep_loss_sum, ep_n = 0.0, 0                          # 이 epoch 평균 train loss 집계(flow 기준, 분모=step 수)
+        # train_{flow,lm,gate_ce}_avg 집계용: lm/gate는 라벨을 가진 step에만 존재하므로 evaluate()의
+        #   val_lm/val_gate_ce와 동일 원칙(가중치 g_has/g_has_gate로 가중합 후 그 가중치 합으로 나눔)을 쓴다.
+        #   selective_view 등 설정에 따라 gate가 아예 없는 step만 있을 수도 있어(gate_weight=0), 분모가
+        #   0이면 최종적으로 해당 train_*_avg 키 자체를 생략(val 쪽과 동일한 "있을 때만 기록" 관례).
+        ep_flow_sum = 0.0
+        ep_lm_wsum, ep_lm_wtot = 0.0, 0.0
+        ep_gate_wsum, ep_gate_wtot = 0.0, 0.0
         step_in_ep = 0                                       # 이 epoch 안에서의 step(로깅용 1-base)
         opt.zero_grad(set_to_none=True)                      # 누적 그룹 시작 전 grad 초기화(이후엔 경계에서만)
         # DataLoader가 shard를 shuffle+prefetch로 흘려준다(워커가 다음 배치 load+preprocess를 미리 수행).
@@ -1582,7 +1648,8 @@ def main() -> None:
                                           reasoning_types=reasoning_types, ego_dim=ego_dim, temporal_on=temporal_on,
                                           reas_weight=args.reas_weight, gate_weight=args.gate_weight,
                                           gate_alpha=gate_alpha, gate_focal_gamma=args.gate_focal_gamma,
-                                          selective_view=args.selective_view, forcing=args.forcing)
+                                          selective_view=args.selective_view, forcing=args.forcing,
+                                          gate_num=args.gate_num)
                 flow = st["flow_sum"] / max(st["n"], 1)
                 lm_loss = (st["lm_sum"] / st["lm_n"]) if st["lm_n"] > 0 else None
                 gate_ce = (st["gate_sum"] / st["gate_n"]) if st["gate_n"] > 0 else None
@@ -1620,6 +1687,9 @@ def main() -> None:
             g_gate_sum = ddp.all_reduce_mean(float(gate_ce) if gate_ce is not None else 0.0)
             g_has_gate = ddp.all_reduce_mean(has_gate)       # gate 라벨 보유 rank 비율
             ep_loss_sum += g_flow; ep_n += 1                # epoch 평균은 flow 기준(전 rank 공통)
+            ep_flow_sum += g_flow                           # train_flow_avg (분모=ep_n, 모든 step에 존재)
+            ep_lm_wsum += g_lm_sum; ep_lm_wtot += g_has     # train_lm_avg (분모=라벨 보유 가중치 합)
+            ep_gate_wsum += g_gate_sum; ep_gate_wtot += g_has_gate   # train_gate_ce_avg (분모=gate 라벨 보유 가중치 합)
             live = {"loss": float(loss), "flow": g_flow}
             if g_has > 0:                                    # 이번 step에 reasoning 가진 rank가 하나라도
                 live["lm"] = g_lm_sum / g_has               # 보유 rank들 평균 lm
@@ -1632,6 +1702,15 @@ def main() -> None:
 
         # epoch 종합: 평균 train loss + (eval-every 주기면) val eval. 터미널 영구 줄 + 로그파일 기록.
         ep_avg = ep_loss_sum / max(ep_n, 1)
+        # train_{flow,lm,gate_ce}_avg: 이 epoch 동안의 각 손실 성분 평균(전 rank 공통, all_reduce 기반이라
+        #   집계값 자체는 이미 동기화돼 있음). selective_view/--reasoning-types/--gate-weight 설정에 따라
+        #   lm_avg·gate_ce_avg는 그 손실이 아예 없는 epoch도 있으므로(가중치 합=0) 그 경우 키를 생략한다
+        #   (val_lm/val_gate_ce와 동일한 "있을 때만 기록" 관례 — evaluate() 참고).
+        train_avg = {"train_flow_avg": ep_flow_sum / max(ep_n, 1)}
+        if ep_lm_wtot > 0:
+            train_avg["train_lm_avg"] = ep_lm_wsum / ep_lm_wtot
+        if ep_gate_wtot > 0:
+            train_avg["train_gate_ce_avg"] = ep_gate_wsum / ep_gate_wtot
         ev = None
         if args.eval_every > 0 and (epoch % args.eval_every == 0 or done):
             # 분산 eval: 전 rank가 자기 val 샤드를 forward하고 내부에서 all_reduce로 집계 →
@@ -1642,7 +1721,7 @@ def main() -> None:
                           gate_focal_gamma=args.gate_focal_gamma,
                           temporal_clip=args.temporal_clip, selective_view=args.selective_view,
                           forcing=args.forcing, keyframe_eval=args.keyframe_eval,
-                          keyframe_select=keyframe_select)
+                          keyframe_select=keyframe_select, gate_num=args.gate_num)
         # best 갱신: val_loss가 이전 최소보다 낮으면 이 epoch을 best로 기록하고 가중치를 CPU 스냅샷.
         #   전 rank가 동일 ev["val_loss"]를 보므로 best_epoch 판단은 일치(스냅샷만 rank0).
         is_best = ev is not None and ev["val_loss"] < best_val
@@ -1662,7 +1741,7 @@ def main() -> None:
                                    for k, v in gate_mod.state_dict().items()}
         # epoch 요약에 best 표시(★ = 이번이 best). 로그파일에도 best 추적이 남는다.
         extra = f"total {step}/{total_steps}" + (f"  ★best(val {best_val:.4f})" if is_best else "")
-        logger.epoch(epoch, ep_avg, eval=ev, extra=extra)  # 전체 진행률
+        logger.epoch(epoch, ep_avg, train_metrics=train_avg, eval=ev, extra=extra)  # 전체 진행률
 
     # 학습 종료: optimizer state(full FT는 2B분 → 수 GB)와 grad를 즉시 해제하고 캐시를 비운다.
     # ⚠️ 안 그러면 full 모드에서 GPU가 거의 꽉 찬 채로 저장·cleanup·final-eval에 들어가 OOM 난다
@@ -1719,8 +1798,8 @@ def main() -> None:
             "keyframe_eval": args.keyframe_eval,           # 검증/최종평가를 keyframe(decision, 0.2Hz)만 채점(논문 정렬).
             "keyframe_select": list(keyframe_select),      # clip당 decision 3개 중 채점 순서(기본 [1]=정중앙).
             "seed": seed,                                  # 랜덤 시드(--seed override, 기본 vlm.SEED).
-            # 1단계 게이트(cond→직진/좌/우): μ(gate_weight)>0이면 GateHead 학습(gate_head.pt 저장됨).
-            "gate_weight": args.gate_weight, "gate_hidden": args.gate_hidden,
+            # 1단계 게이트(cond→직진/좌/우[/turn_left/turn_right]): μ(gate_weight)>0이면 GateHead 학습(gate_head.pt).
+            "gate_weight": args.gate_weight, "gate_hidden": args.gate_hidden, "gate_num": args.gate_num,
             "gate_focal_gamma": args.gate_focal_gamma,
             "gate_alpha": gate_alpha.tolist() if gate_alpha is not None else None,
             # 시간 맥락: 학습이 실제로 과거 1 timestep(8뷰)을 condition에 넣었는지 + 그 offset(프레임).
@@ -1787,4 +1866,13 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as e:                # noqa: BLE001 — 학습/검증 중 어떤 예외든 train.log에 남긴다
+        # main() 안에서 logger.close()가 아직 안 불렸다면(=학습·검증·최종eval 도중 예외) RunLogger.active가
+        # 살아있는 그 run의 인스턴스다. 여기서 남기면 "running final eval ..." 같은 데서 로그가 아무 설명
+        # 없이 뚝 끊기던 문제가 없어진다 — main() 내부를 통째로 재들여쓰기하지 않고 최소 침습으로 해결.
+        if RunLogger.active is not None:
+            RunLogger.active.error(e)
+            RunLogger.active.close()
+        raise
